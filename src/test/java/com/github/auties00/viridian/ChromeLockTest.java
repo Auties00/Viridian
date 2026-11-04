@@ -7,9 +7,12 @@ import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
-import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -60,8 +63,10 @@ class ChromeLockTest {
             browser.waitFor(10, TimeUnit.SECONDS);
         }
         browser = chrome(userData, "--remote-debugging-port=0");
+        var second = browser;
         try {
-            waitFor(() -> isLocked(userData) && Files.exists(profile.directory().resolve("Preferences")), Duration.ofSeconds(30));
+            // The first Chrome's lock may outlive it, naming a process that is gone, so wait for this one's
+            waitFor(() -> isLockedBy(userData, second), Duration.ofSeconds(30));
             assertThrows(ProfileInUseException.class, () -> ProfileLock.acquire(profile.lockDirectory()));
             assertThrows(ProfileInUseException.class, () -> profile.localStorage().replaceAll(StorageOrigin.parse("https://example.com"), java.util.Map.of("a", "b")));
             assertTrue(profile.isInUse());
@@ -72,8 +77,26 @@ class ChromeLockTest {
         }
     }
 
-    private static boolean isLocked(Path userData) {
-        return Files.exists(userData.resolve("lockfile")) || Files.exists(userData.resolve("SingletonLock"), LinkOption.NOFOLLOW_LINKS);
+    /// {@return whether `browser` holds the lock: elsewhere than Windows a `SingletonLock` naming its process, which is
+    /// the browser process itself; on Windows a `lockfile` no one else may write}
+    private static boolean isLockedBy(Path userData, Process browser) throws IOException {
+        var link = userData.resolve("SingletonLock");
+        if (Files.isSymbolicLink(link)) {
+            try {
+                return Files.readSymbolicLink(link).toString().endsWith("-" + browser.pid());
+            } catch (NoSuchFileException _) {
+                return false;
+            }
+        }
+        var lockfile = userData.resolve("lockfile");
+        if (!Files.exists(lockfile)) {
+            return false;
+        }
+        try (var _ = FileChannel.open(lockfile, StandardOpenOption.WRITE)) {
+            return false;
+        } catch (FileSystemException _) {
+            return true;
+        }
     }
 
     private interface Condition {
