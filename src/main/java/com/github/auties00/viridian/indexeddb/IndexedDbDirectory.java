@@ -1,7 +1,7 @@
 package com.github.auties00.viridian.indexeddb;
 
 import com.github.auties00.viridian.IndexedDatabase;
-import com.github.auties00.viridian.IndexedDbBackend;
+import com.github.auties00.viridian.StorageBackend;
 import com.github.auties00.viridian.StorageOrigin;
 
 import java.io.IOException;
@@ -47,7 +47,7 @@ public final class IndexedDbDirectory {
                 var name = entry.getFileName().toString();
                 if (name.endsWith(LEVELDB_SUFFIX) && Files.isDirectory(entry)) {
                     identifiers.add(name.substring(0, name.length() - LEVELDB_SUFFIX.length()));
-                } else if (!name.contains(".") && Files.isDirectory(entry) && !sqliteFiles(entry).isEmpty()) {
+                } else if (!name.endsWith(BLOB_SUFFIX) && Files.isDirectory(entry) && !sqliteFiles(entry).isEmpty()) {
                     identifiers.add(name);
                 }
             }
@@ -66,18 +66,18 @@ public final class IndexedDbDirectory {
     /// {@return the backend that holds `origin`'s data, or an empty optional if it has none}
     ///
     /// @throws IOException if the directory cannot be listed
-    public Optional<IndexedDbBackend> backend(StorageOrigin origin) throws IOException {
+    public Optional<StorageBackend> backend(StorageOrigin origin) throws IOException {
         if (Files.isDirectory(levelDbDirectory(origin))) {
-            return Optional.of(IndexedDbBackend.LEVELDB);
+            return Optional.of(StorageBackend.LEVELDB);
         }
         var sqlite = root.resolve(origin.identifier());
-        return Files.isDirectory(sqlite) && !sqliteFiles(sqlite).isEmpty() ? Optional.of(IndexedDbBackend.SQLITE) : Optional.empty();
+        return Files.isDirectory(sqlite) && !sqliteFiles(sqlite).isEmpty() ? Optional.of(StorageBackend.SQLITE) : Optional.empty();
     }
 
     /// {@return the names of `origin`'s databases in `backend`, sorted}
     ///
     /// @throws IOException if the files cannot be read, or the metadata does not decode
-    public List<String> names(StorageOrigin origin, IndexedDbBackend backend) throws IOException {
+    public List<String> names(StorageOrigin origin, StorageBackend backend) throws IOException {
         var names = new TreeSet<String>();
         switch (backend) {
             case LEVELDB -> {
@@ -106,7 +106,7 @@ public final class IndexedDbDirectory {
     /// {@return the database `name` of `origin` in `backend`, open, or an empty optional if there is none}
     ///
     /// @throws IOException if the files cannot be read, or the metadata does not decode
-    public Optional<IndexedDatabase> open(StorageOrigin origin, String name, IndexedDbBackend backend) throws IOException {
+    public Optional<IndexedDatabase> open(StorageOrigin origin, String name, StorageBackend backend) throws IOException {
         return switch (backend) {
             case LEVELDB -> {
                 if (!Files.isDirectory(levelDbDirectory(origin))) {

@@ -120,5 +120,7 @@ jobs:
             ${{ runner.temp }}/profile/Default/IndexedDB/
             ${{ runner.temp }}/profile/Default/Local Storage/
             ${{ runner.temp }}/profile/Default/Session Storage/
+            ${{ runner.temp }}/profile/Default/LocalStorage*
+            ${{ runner.temp }}/profile/Default/SessionStorage*
             target/surefire-reports/
           retention-days: 14

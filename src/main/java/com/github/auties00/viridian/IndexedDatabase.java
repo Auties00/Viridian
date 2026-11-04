@@ -29,7 +29,7 @@ public sealed interface IndexedDatabase extends AutoCloseable permits LevelDbInd
     long version();
 
     /// {@return how Chromium stores the database}
-    IndexedDbBackend backend();
+    StorageBackend backend();
 
     /// {@return the object stores, by id}
     List<IdbObjectStore> objectStores();

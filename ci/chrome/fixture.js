@@ -230,8 +230,12 @@ window.writeFixture = async function () {
   localStorage.setItem('latin', 'café');
   localStorage.setItem('unicode', '你好 😀');
   localStorage.setItem('é key', 'ascii value');
+  // Past the SQLite backend's 350-byte threshold, so it compresses them
+  localStorage.setItem('long latin', 'compressible '.repeat(100));
+  localStorage.setItem('long unicode', 'é你 '.repeat(200));
   for (const key of Object.keys(localStorage)) lines.push(['local', hex16(key), hex16(localStorage.getItem(key))].join('\t'));
   sessionStorage.setItem('session key', 'session value é你');
+  sessionStorage.setItem('long', 'session '.repeat(100));
   for (const key of Object.keys(sessionStorage)) lines.push(['session', hex16(key), hex16(sessionStorage.getItem(key))].join('\t'));
   return lines.join('\n');
 };

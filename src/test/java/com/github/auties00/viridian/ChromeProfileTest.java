@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /// A profile a real Chrome wrote, which CI makes with `ci/chrome/generate.mjs`: everything Viridian reads must match
@@ -56,10 +57,17 @@ class ChromeProfileTest {
     void matchesChrome() throws IOException {
         var manifest = Files.readAllLines(Path.of(System.getenv("VIRIDIAN_CHROME_MANIFEST")), StandardCharsets.UTF_8);
         var origin = StorageOrigin.parse(manifest.get(0).split("\t")[1]);
-        var backend = IndexedDbBackend.valueOf(manifest.get(1).split("\t")[1].toUpperCase());
+        var backend = StorageBackend.valueOf(manifest.get(1).split("\t")[1].toUpperCase());
         var expected = manifest.subList(2, manifest.size());
         var profile = ChromiumProfile.open(Path.of(System.getenv("VIRIDIAN_CHROME_PROFILE")));
-        assertEquals(backend, profile.indexedDbBackend(origin).orElseThrow(), "the backend Chrome used");
+        // The workflow runs Chrome with IndexedDB and DOM Storage on the same backend
+        assertEquals(backend, profile.indexedDbBackend(origin).orElseThrow(), "the IndexedDB backend Chrome used");
+        assertEquals(backend, profile.localStorageBackend().orElseThrow(), "the localStorage backend Chrome used");
+        assertEquals(backend, profile.sessionStorageBackend().orElseThrow(), "the sessionStorage backend Chrome used");
+        var indexedDbOrigins = profile.indexedDbOrigins();
+        assertTrue(indexedDbOrigins.contains(origin), origin + " is not among the IndexedDB origins " + indexedDbOrigins);
+        var localStorageOrigins = profile.localStorageOrigins();
+        assertTrue(localStorageOrigins.contains(origin), origin + " is not among the localStorage origins " + localStorageOrigins);
 
         var actual = new ArrayList<String>();
         for (var line : expected) {

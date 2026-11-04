@@ -6,7 +6,7 @@ import com.github.auties00.viridian.IdbKeyPath;
 import com.github.auties00.viridian.IdbObjectStore;
 import com.github.auties00.viridian.IdbRecord;
 import com.github.auties00.viridian.IndexedDatabase;
-import com.github.auties00.viridian.IndexedDbBackend;
+import com.github.auties00.viridian.StorageBackend;
 import com.github.auties00.viridian.StorageOrigin;
 import com.github.auties00.viridian.ViridianException;
 import com.github.auties00.viridian.compress.Snappy;
@@ -191,8 +191,8 @@ public final class SqliteIndexedDatabase implements IndexedDatabase {
     }
 
     @Override
-    public IndexedDbBackend backend() {
-        return IndexedDbBackend.SQLITE;
+    public StorageBackend backend() {
+        return StorageBackend.SQLITE;
     }
 
     @Override

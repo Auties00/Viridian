@@ -1,13 +1,13 @@
 package com.github.auties00.viridian;
 
-import com.github.auties00.viridian.domstorage.DomStorage;
+import com.github.auties00.viridian.domstorage.LevelDbDomStorage;
+import com.github.auties00.viridian.domstorage.SqliteDomStorage;
 import com.github.auties00.viridian.indexeddb.IndexedDbDirectory;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -71,7 +71,7 @@ public final class ChromiumProfile {
     /// move an origin off LevelDB until it migrates its data.
     ///
     /// @throws IOException if the profile's `IndexedDB` directory cannot be listed
-    public Optional<IndexedDbBackend> indexedDbBackend(StorageOrigin origin) throws IOException {
+    public Optional<StorageBackend> indexedDbBackend(StorageOrigin origin) throws IOException {
         return indexedDb.backend(origin);
     }
 
@@ -90,7 +90,7 @@ public final class ChromiumProfile {
     ///
     /// @throws ViridianException if the metadata does not decode
     /// @throws IOException       if the files cannot be read
-    public List<String> indexedDbNames(StorageOrigin origin, IndexedDbBackend backend) throws IOException {
+    public List<String> indexedDbNames(StorageOrigin origin, StorageBackend backend) throws IOException {
         return indexedDb.names(origin, Objects.requireNonNull(backend, "backend"));
     }
 
@@ -109,40 +109,114 @@ public final class ChromiumProfile {
     /// @throws ViridianException if the database's metadata does not decode, or its schema is newer than this reader
     ///                           knows
     /// @throws IOException       if the files cannot be read
-    public Optional<IndexedDatabase> openIndexedDb(StorageOrigin origin, String name, IndexedDbBackend backend) throws IOException {
+    public Optional<IndexedDatabase> openIndexedDb(StorageOrigin origin, String name, StorageBackend backend) throws IOException {
         return indexedDb.open(origin, Objects.requireNonNull(name, "name"), Objects.requireNonNull(backend, "backend"));
     }
 
-    /// {@return `origin`'s `localStorage` items, by key; empty if it has none}
+    /// {@return the backend that holds the profile's `localStorage`, or an empty optional if it has none}
     ///
-    /// @throws ViridianException if an item does not decode
+    /// When both backends hold it, the SQLite one is the profile's, as it is for Chromium, which creates a SQLite
+    /// database only where it uses SQLite and deletes the LevelDB one once it has migrated it.
+    public Optional<StorageBackend> localStorageBackend() {
+        return domStorageBackend(localStorageSqlite(), localStorageLevelDb());
+    }
+
+    /// {@return `origin`'s `localStorage` items, by key, in the backend that holds the profile's; empty if it has none}
+    ///
+    /// @throws ViridianException if the database's schema is newer than this reader knows, or an item does not decode
     /// @throws IOException       if the Local Storage database cannot be read
     public Map<String, String> localStorage(StorageOrigin origin) throws IOException {
-        var database = directory.resolve("Local Storage").resolve("leveldb");
-        return Files.isDirectory(database) ? DomStorage.localStorage(database, origin) : Map.of();
+        Objects.requireNonNull(origin, "origin");
+        var backend = localStorageBackend();
+        return backend.isEmpty() ? Map.of() : localStorage(origin, backend.get());
     }
 
-    /// {@return the origins with `localStorage` items}
+    /// {@return `origin`'s `localStorage` items, by key, in `backend`; empty if it has none}
     ///
-    /// @throws IOException if the Local Storage database cannot be read
+    /// @throws ViridianException if the database's schema is newer than this reader knows, or an item does not decode
+    /// @throws IOException       if the Local Storage database cannot be read
+    public Map<String, String> localStorage(StorageOrigin origin, StorageBackend backend) throws IOException {
+        Objects.requireNonNull(origin, "origin");
+        return switch (Objects.requireNonNull(backend, "backend")) {
+            case LEVELDB -> Files.isDirectory(localStorageLevelDb()) ? LevelDbDomStorage.localStorage(localStorageLevelDb(), origin) : Map.of();
+            case SQLITE -> Files.isRegularFile(localStorageSqlite()) ? SqliteDomStorage.localStorage(localStorageSqlite(), origin) : Map.of();
+        };
+    }
+
+    /// {@return the origins with `localStorage` items, in the backend that holds the profile's}
+    ///
+    /// @throws ViridianException if the database's schema is newer than this reader knows
+    /// @throws IOException       if the Local Storage database cannot be read
     public List<StorageOrigin> localStorageOrigins() throws IOException {
-        var database = directory.resolve("Local Storage").resolve("leveldb");
-        return Files.isDirectory(database) ? DomStorage.localStorageOrigins(database) : List.of();
+        var backend = localStorageBackend();
+        return backend.isEmpty() ? List.of() : localStorageOrigins(backend.get());
     }
 
-    /// {@return `origin`'s `sessionStorage`, one area per browsing session the browser kept; empty if it has none}
+    /// {@return the origins with `localStorage` items in `backend`}
     ///
-    /// @throws IOException if the Session Storage database cannot be read
+    /// @throws ViridianException if the database's schema is newer than this reader knows
+    /// @throws IOException       if the Local Storage database cannot be read
+    public List<StorageOrigin> localStorageOrigins(StorageBackend backend) throws IOException {
+        return switch (Objects.requireNonNull(backend, "backend")) {
+            case LEVELDB -> Files.isDirectory(localStorageLevelDb()) ? LevelDbDomStorage.localStorageOrigins(localStorageLevelDb()) : List.of();
+            case SQLITE -> Files.isRegularFile(localStorageSqlite()) ? SqliteDomStorage.localStorageOrigins(localStorageSqlite()) : List.of();
+        };
+    }
+
+    /// {@return the backend that holds the profile's `sessionStorage`, or an empty optional if it has none}
+    ///
+    /// When both backends hold it, the SQLite one is the profile's, as for [#localStorageBackend()].
+    public Optional<StorageBackend> sessionStorageBackend() {
+        return domStorageBackend(sessionStorageSqlite(), sessionStorageLevelDb());
+    }
+
+    /// {@return `origin`'s `sessionStorage`, one area per browsing session the browser kept in session id order, in the
+    /// backend that holds the profile's; empty if it has none}
+    ///
+    /// @throws ViridianException if the database's schema is newer than this reader knows, or a value does not decode
+    /// @throws IOException       if the Session Storage database cannot be read
     public List<SessionStorageArea> sessionStorage(StorageOrigin origin) throws IOException {
-        var database = directory.resolve("Session Storage");
-        if (!Files.isDirectory(database)) {
-            return List.of();
+        Objects.requireNonNull(origin, "origin");
+        var backend = sessionStorageBackend();
+        return backend.isEmpty() ? List.of() : sessionStorage(origin, backend.get());
+    }
+
+    /// {@return `origin`'s `sessionStorage` in `backend`, one area per browsing session the browser kept in session id
+    /// order; empty if it has none}
+    ///
+    /// @throws ViridianException if the database's schema is newer than this reader knows, or a value does not decode
+    /// @throws IOException       if the Session Storage database cannot be read
+    public List<SessionStorageArea> sessionStorage(StorageOrigin origin, StorageBackend backend) throws IOException {
+        Objects.requireNonNull(origin, "origin");
+        return switch (Objects.requireNonNull(backend, "backend")) {
+            case LEVELDB -> Files.isDirectory(sessionStorageLevelDb()) ? LevelDbDomStorage.sessionStorage(sessionStorageLevelDb(), origin) : List.of();
+            case SQLITE -> Files.isRegularFile(sessionStorageSqlite()) ? SqliteDomStorage.sessionStorage(sessionStorageSqlite(), origin) : List.of();
+        };
+    }
+
+    /// {@return the backend of a DOM Storage database: SQLite when its file exists, else LevelDB when its directory
+    /// does}
+    private static Optional<StorageBackend> domStorageBackend(Path sqlite, Path levelDb) {
+        if (Files.isRegularFile(sqlite)) {
+            return Optional.of(StorageBackend.SQLITE);
         }
-        var areas = new ArrayList<SessionStorageArea>();
-        for (var area : DomStorage.sessionStorage(database, origin)) {
-            areas.add(new SessionStorageArea(area.namespaceId(), area.items()));
-        }
-        return areas;
+        return Files.isDirectory(levelDb) ? Optional.of(StorageBackend.LEVELDB) : Optional.empty();
+    }
+
+    private Path localStorageLevelDb() {
+        return directory.resolve("Local Storage").resolve("leveldb");
+    }
+
+    private Path localStorageSqlite() {
+        return directory.resolve("LocalStorage");
+    }
+
+    private Path sessionStorageLevelDb() {
+        return directory.resolve("Session Storage");
+    }
+
+    private Path sessionStorageSqlite() {
+        return directory.resolve("SessionStorage");
     }
 
     @Override

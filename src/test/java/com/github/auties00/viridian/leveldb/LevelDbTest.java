@@ -7,6 +7,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.io.TempDirDeletionStrategy.IgnoreFailures;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
@@ -28,11 +29,6 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /// The LevelDB reader against files written by hand, with checksums, and against databases iq80's LevelDB writes.
 class LevelDbTest {
-    static {
-        // iq80 maps its tables, and Windows cannot delete a mapped file until the mapping is collected
-        System.setProperty("leveldb.mmap", "false");
-    }
-
     private static byte[] bytes(String value) {
         return value.getBytes(StandardCharsets.UTF_8);
     }
@@ -147,13 +143,15 @@ class LevelDbTest {
         }
     }
 
+    // iq80 keeps its tables mapped after it closes, and Windows cannot delete a mapped file. Unmapped, iq80 reads its
+    // tables into heap buffers, which xerial's Snappy rejects, so every compaction fails and is retried forever
     @Nested
     @DisplayName("against iq80's LevelDB")
     class Oracle {
         @ParameterizedTest(name = "{0}")
         @EnumSource(CompressionType.class)
         @DisplayName("random writes and deletions, flushed and compacted through a small write buffer, read back as the model holds them")
-        void random(CompressionType compression, @TempDir Path directory) throws IOException {
+        void random(CompressionType compression, @TempDir(deletionStrategy = IgnoreFailures.class) Path directory) throws IOException {
             var model = new TreeMap<String, String>();
             var random = new Random(compression.ordinal() + 7L);
             var options = new Options().createIfMissing(true).writeBufferSize(16 * 1024).compressionType(compression).blockSize(1024);
@@ -177,7 +175,7 @@ class LevelDbTest {
 
         @Test
         @DisplayName("a database still being written, with a log and no clean close, reads as written so far")
-        void open(@TempDir Path directory) throws IOException {
+        void open(@TempDir(deletionStrategy = IgnoreFailures.class) Path directory) throws IOException {
             var options = new Options().createIfMissing(true).writeBufferSize(4 * 1024 * 1024);
             var model = new TreeMap<String, String>();
             try (var database = Iq80DBFactory.factory.open(directory.toFile(), options)) {

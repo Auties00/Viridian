@@ -24,13 +24,16 @@ app's `EBWebView/Default`.
 |---|---|
 | IndexedDB, LevelDB backend | `IndexedDB/<origin>.indexeddb.leveldb`, one database per origin, with large blobs in `<origin>.indexeddb.blob` |
 | IndexedDB, SQLite backend | `IndexedDB/<origin>/`, one SQLite file per database, blobs included; Chrome began rolling it out for new databases in Chrome 156 |
-| `localStorage` | `Local Storage/leveldb` |
-| `sessionStorage` | `Session Storage`, one area per browsing session the browser kept |
+| `localStorage`, LevelDB backend | `Local Storage/leveldb` |
+| `localStorage`, SQLite backend | `LocalStorage`, one SQLite file, which Chrome is rolling out through field trials |
+| `sessionStorage`, LevelDB backend | `Session Storage`, one area per browsing session the browser kept |
+| `sessionStorage`, SQLite backend | `SessionStorage`, one SQLite file |
 
-An origin can have data in both IndexedDB backends. `openIndexedDb(origin, name)` reads the one Chromium reads: the
-LevelDB one, as Chromium keeps an origin there until it migrates its data. `indexedDbBackend(origin)` says which one
-that is, and the overloads that take an `IndexedDbBackend` read the other. A database's records come in key order,
-from `records(store)` or `record(store, key)`.
+A profile can hold data in both backends. Every method reads the backend Chromium reads, and an overload that takes
+a `StorageBackend` reads the other. For IndexedDB that is LevelDB, where Chromium keeps an origin until it migrates
+its data; for DOM Storage it is SQLite, which Chromium creates only where it uses SQLite, deleting the LevelDB
+database once it has migrated it. `indexedDbBackend(origin)`, `localStorageBackend()` and `sessionStorageBackend()`
+say which one that is. A database's records come in key order, from `records(store)` or `record(store, key)`.
 
 Inside, Viridian has its own LevelDB reader (descriptors, logs, tables, checksums), SQLite reader (b-trees, overflow
 pages, rollback journals and write-ahead logs) and Snappy and zstd decoders.
@@ -80,7 +83,6 @@ the readers throw rather than loop or recurse without bound.
 - It does not write. Writing a profile, so that data can move into a browser as well as out of one, is planned.
 - It never decrypts what a browser keeps encrypted for its user, such as saved passwords and cookies.
 - It reads first-party storage, not partitioned (third-party) or Storage Buckets storage.
-- It does not read Chromium's SQLite backend for Local and Session Storage, which Chromium leaves off by default.
 
 ## Tested on
 
@@ -88,10 +90,11 @@ CI runs the tests on Windows, macOS and Linux. They check the SQLite reader agai
 decoders against their reference implementations (the zstd one on fuzzed input as well), and the LevelDB reader
 against iq80's LevelDB.
 
-Then Chrome writes a profile on each IndexedDB backend: Chrome for Testing of the stable channel on Windows, macOS and
-Linux, and of the beta channel on Linux. The page stores every kind of value, key, blob and file, a non-extractable `CryptoKey`, and `localStorage` and
-`sessionStorage` items, then reads it all back. Everything Viridian reads from the profile must match what the page
-read. The workflow runs weekly too, to catch a Chrome release that changes a format.
+Then Chrome writes a profile on each backend, with IndexedDB and DOM Storage both on LevelDB or both on SQLite:
+Chrome for Testing of the stable channel on Windows, macOS and Linux, and of the beta channel on Linux. The page
+stores every kind of value, key, blob and file, a non-extractable `CryptoKey`, and `localStorage` and
+`sessionStorage` items long enough to be compressed, then reads it all back. Everything Viridian reads from the
+profile must match what the page read. The workflow runs weekly too, to catch a Chrome release that changes a format.
 
 ## Building
 

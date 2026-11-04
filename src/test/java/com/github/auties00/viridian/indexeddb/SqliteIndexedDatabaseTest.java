@@ -4,7 +4,7 @@ import com.github.auties00.viridian.ChromiumProfile;
 import com.github.auties00.viridian.IdbKey;
 import com.github.auties00.viridian.IdbKeyPath;
 import com.github.auties00.viridian.IdbRecord;
-import com.github.auties00.viridian.IndexedDbBackend;
+import com.github.auties00.viridian.StorageBackend;
 import com.github.auties00.viridian.StorageOrigin;
 import com.github.auties00.viridian.ViridianException;
 import com.github.auties00.viridian.value.ExternalObject;
@@ -144,7 +144,7 @@ class SqliteIndexedDatabaseTest {
 
         var chromium = ChromiumProfile.open(profile);
         assertEquals(List.of(ORIGIN), chromium.indexedDbOrigins());
-        assertEquals(IndexedDbBackend.SQLITE, chromium.indexedDbBackend(ORIGIN).orElseThrow());
+        assertEquals(StorageBackend.SQLITE, chromium.indexedDbBackend(ORIGIN).orElseThrow());
         assertEquals(List.of("app"), chromium.indexedDbNames(ORIGIN));
         try (var database = chromium.openIndexedDb(ORIGIN, "app").orElseThrow()) {
             assertEquals(2, database.version());
@@ -207,6 +207,6 @@ class SqliteIndexedDatabaseTest {
         Files.createDirectories(root.resolve("https_example.com_0.indexeddb.leveldb"));
         Files.createDirectories(root.resolve("https_example.com_0"));
         Files.writeString(root.resolve("https_example.com_0").resolve(IndexedDbDirectory.sqliteFileName("app")), "");
-        assertEquals(IndexedDbBackend.LEVELDB, new IndexedDbDirectory(root).backend(ORIGIN).orElseThrow());
+        assertEquals(StorageBackend.LEVELDB, new IndexedDbDirectory(root).backend(ORIGIN).orElseThrow());
     }
 }
