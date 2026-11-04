@@ -5,9 +5,9 @@ import com.github.auties00.viridian.IdbKey;
 import com.github.auties00.viridian.IdbKeyPath;
 import com.github.auties00.viridian.IdbRecord;
 import com.github.auties00.viridian.StorageBackend;
+import com.github.auties00.viridian.StorageBucket;
 import com.github.auties00.viridian.StorageOrigin;
 import com.github.auties00.viridian.ViridianException;
-import com.github.auties00.viridian.value.ExternalObject;
 import com.github.auties00.viridian.value.JsArray;
 import com.github.auties00.viridian.value.JsBlob;
 import com.github.auties00.viridian.value.JsFile;
@@ -26,6 +26,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.List;
+import java.util.Optional;
 import java.util.Random;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -36,7 +37,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The SQLite IndexedDB backend against a database with Chromium's schema, written by SQLite itself and read while
 /// its write-ahead log still holds the writes.
-class SqliteIndexedDatabaseTest {
+class SqliteDatabaseReaderTest {
     private static final StorageOrigin ORIGIN = StorageOrigin.parse("https://example.com");
     // Chromium's schema, version 1, as content/browser/indexed_db/instance/sqlite/database_connection.cc creates it
     private static final List<String> SCHEMA = List.of(
@@ -85,7 +86,7 @@ class SqliteIndexedDatabaseTest {
             insert(connection, "INSERT INTO object_stores VALUES (?, ?, ?, ?, ?)", 1, utf16("users"), utf16("id"), 0, 1);
             insert(connection, "INSERT INTO object_stores VALUES (?, ?, ?, ?, ?)", 2, utf16("files"), null, 1, 3);
             insert(connection, "INSERT INTO indexes VALUES (?, ?, ?, ?, ?, ?)", 1, 30, utf16("byName"), utf16("name"), 1, 0);
-            insert(connection, "INSERT INTO indexes VALUES (?, ?, ?, ?, ?, ?)", 1, 31, utf16("pair"), utf16("first last"), 0, 1);
+            insert(connection, "INSERT INTO indexes VALUES (?, ?, ?, ?, ?, ?)", 1, 31, utf16("pair"), utf16("first last"), 1, 0);
 
             var plain = V8Writer.blink().latin1("plain").toByteArray();
             insert(connection, "INSERT INTO records VALUES (?, ?, ?, ?, ?)", 1, 1, 0, IdbKeyCodec.encodeSortable(new IdbKey.StringKey("b")), plain);
@@ -143,15 +144,15 @@ class SqliteIndexedDatabaseTest {
         write(origin.resolve("db"), file, largeValue, bigBlob);
 
         var chromium = ChromiumProfile.open(profile);
-        assertEquals(List.of(ORIGIN), chromium.indexedDbOrigins());
-        assertEquals(StorageBackend.SQLITE, chromium.indexedDbBackend(ORIGIN).orElseThrow());
-        assertEquals(List.of("app"), chromium.indexedDbNames(ORIGIN));
-        try (var database = chromium.openIndexedDb(ORIGIN, "app").orElseThrow()) {
+        assertEquals(List.of(ORIGIN), chromium.indexedDb().origins());
+        assertEquals(StorageBackend.SQLITE, chromium.indexedDb().backend(ORIGIN).orElseThrow());
+        assertEquals(List.of("app"), chromium.indexedDb().names(ORIGIN));
+        try (var database = chromium.indexedDb().open(ORIGIN, "app").orElseThrow()) {
             assertEquals(2, database.version());
             var users = database.objectStore("users").orElseThrow();
-            assertEquals(new IdbKeyPath.Single("id"), users.keyPath());
+            assertEquals(Optional.of(new IdbKeyPath.Single("id")), users.keyPath());
             assertEquals(new IdbKeyPath.Compound(List.of("first", "last")), users.index("pair").orElseThrow().keyPath());
-            assertTrue(users.index("pair").orElseThrow().multiEntry());
+            assertTrue(users.index("pair").orElseThrow().unique());
             assertTrue(database.objectStore("files").orElseThrow().autoIncrement());
 
             List<IdbRecord> records;
@@ -165,9 +166,13 @@ class SqliteIndexedDatabaseTest {
             assertEquals(new JsString(large.toString()), records.get(2).value());
             assertEquals(new JsString("plain"), records.get(3).value());
 
-            var files = database.record("files", new IdbKey.NumberKey(1)).orElseThrow();
-            assertInstanceOf(ExternalObject.FileSystemAccessHandle.class, files.externalObjects().getLast());
-            var array = assertInstanceOf(JsArray.class, files.value());
+            JsArray array;
+            try (var cursor = database.openCursor("files")) {
+                assertTrue(cursor.next());
+                assertEquals(new IdbKey.NumberKey(1), cursor.key());
+                assertEquals(3, cursor.blobs().size());
+                array = assertInstanceOf(JsArray.class, cursor.value());
+            }
             try (var stream = assertInstanceOf(JsBlob.class, array.get(0).orElseThrow()).open()) {
                 assertArrayEquals(bigBlob, stream.readAllBytes());
             }
@@ -179,7 +184,7 @@ class SqliteIndexedDatabaseTest {
             try (var stream = assertInstanceOf(JsFile.class, array.get(2).orElseThrow()).open()) {
                 assertEquals("legacy", new String(stream.readAllBytes(), StandardCharsets.UTF_8));
             }
-            assertTrue(database.record("files", new IdbKey.NumberKey(2)).isEmpty());
+            assertTrue(database.get("files", new IdbKey.NumberKey(2)).isEmpty());
         }
     }
 
@@ -196,7 +201,7 @@ class SqliteIndexedDatabaseTest {
             insert(connection, "INSERT INTO meta VALUES (?, ?)", "last_compatible_version", 2);
             insert(connection, "INSERT INTO indexed_db_metadata VALUES (?, ?)", utf16("app"), 1);
         }
-        var failure = assertThrows(ViridianException.class, () -> SqliteIndexedDatabase.open(file, ORIGIN));
+        var failure = assertThrows(ViridianException.class, () -> SqliteDatabaseReader.open(file, StorageBucket.defaultOf(ORIGIN)));
         assertEquals(ViridianException.Reason.UNSUPPORTED, failure.reason());
     }
 
@@ -207,6 +212,6 @@ class SqliteIndexedDatabaseTest {
         Files.createDirectories(root.resolve("https_example.com_0.indexeddb.leveldb"));
         Files.createDirectories(root.resolve("https_example.com_0"));
         Files.writeString(root.resolve("https_example.com_0").resolve(IndexedDbDirectory.sqliteFileName("app")), "");
-        assertEquals(StorageBackend.LEVELDB, new IndexedDbDirectory(root).backend(ORIGIN).orElseThrow());
+        assertEquals(StorageBackend.LEVELDB, IndexedDbDirectory.Location.legacy(root, ORIGIN).backend().orElseThrow());
     }
 }

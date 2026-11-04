@@ -6,8 +6,9 @@ import java.util.Objects;
 
 /// The origin storage belongs to: a scheme, a host and a port.
 ///
-/// Chromium names an origin's storage on disk by its identifier, such as `https_web.example.com_0`, where the port is
-/// 0 when it is the scheme's default.
+/// Where a method takes an origin, it means the origin's first-party [StorageKey], and for IndexedDB that key's
+/// default [StorageBucket]: the storage of a page that no other site embeds. Chromium names an origin's storage on disk
+/// by its identifier, such as `https_web.example.com_0`, where the port is 0 when it is the scheme's default.
 ///
 /// @param scheme the scheme, lowercase, such as `https`
 /// @param host   the host, lowercase, such as `example.com`; empty for a `file` origin

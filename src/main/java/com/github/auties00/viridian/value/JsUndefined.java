@@ -1,10 +1,7 @@
 package com.github.auties00.viridian.value;
 
-/// The JavaScript `undefined`.
-public record JsUndefined() implements JsValue {
-    /// The value.
-    public static final JsUndefined INSTANCE = new JsUndefined();
-
+/// The JavaScript `undefined`, which [JsValue#UNDEFINED] holds.
+public record JsUndefined() implements JsPrimitive {
     @Override
     public String toString() {
         return "undefined";

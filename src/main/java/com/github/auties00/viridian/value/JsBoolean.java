@@ -3,7 +3,7 @@ package com.github.auties00.viridian.value;
 /// A JavaScript boolean primitive.
 ///
 /// @param value the boolean
-public record JsBoolean(boolean value) implements JsValue {
+public record JsBoolean(boolean value) implements JsPrimitive {
     /// `true`.
     public static final JsBoolean TRUE = new JsBoolean(true);
 

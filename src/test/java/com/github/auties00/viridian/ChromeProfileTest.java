@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HexFormat;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -61,52 +62,91 @@ class ChromeProfileTest {
         var expected = manifest.subList(2, manifest.size());
         var profile = ChromiumProfile.open(Path.of(System.getenv("VIRIDIAN_CHROME_PROFILE")));
         // The workflow runs Chrome with IndexedDB and DOM Storage on the same backend
-        assertEquals(backend, profile.indexedDbBackend(origin).orElseThrow(), "the IndexedDB backend Chrome used");
-        assertEquals(backend, profile.localStorageBackend().orElseThrow(), "the localStorage backend Chrome used");
-        assertEquals(backend, profile.sessionStorageBackend().orElseThrow(), "the sessionStorage backend Chrome used");
-        var indexedDbOrigins = profile.indexedDbOrigins();
+        assertEquals(backend, profile.indexedDb().backend(origin).orElseThrow(), "the IndexedDB backend Chrome used");
+        assertEquals(backend, profile.localStorage().backend().orElseThrow(), "the localStorage backend Chrome used");
+        assertEquals(backend, profile.sessionStorage().backend().orElseThrow(), "the sessionStorage backend Chrome used");
+        var indexedDbOrigins = profile.indexedDb().origins();
         assertTrue(indexedDbOrigins.contains(origin), origin + " is not among the IndexedDB origins " + indexedDbOrigins);
-        var localStorageOrigins = profile.localStorageOrigins();
+        var localStorageOrigins = profile.localStorage().origins();
         assertTrue(localStorageOrigins.contains(origin), origin + " is not among the localStorage origins " + localStorageOrigins);
 
-        var actual = new ArrayList<String>();
+        // Each context of the page, in the order the manifest names them: "" for its default bucket, "bucket:<name>" for a
+        // named bucket, "partitioned:<top-level site>" for the page in a frame another site embeds
+        var contexts = new LinkedHashSet<String>();
+        contexts.add("");
         for (var line : expected) {
-            if (!line.startsWith("database\t")) {
-                continue;
-            }
-            var name = unhex16(line.split("\t")[1]);
-            try (var database = profile.openIndexedDb(origin, name).orElseThrow(() -> new AssertionError("No database " + name))) {
-                assertEquals(backend, database.backend());
-                actual.add(String.join("\t", "database", JsDescriber.hex16(name), Long.toString(database.version())));
-                var stores = new ArrayList<>(database.objectStores());
-                // DOMStringList, which objectStoreNames and indexNames are, sorts its names
-                stores.sort(Comparator.comparing(IdbObjectStore::name));
-                for (var store : stores) {
-                    var indexes = store.indexes().stream()
-                            .sorted(Comparator.comparing(IdbIndex::name))
-                            .map(index -> JsDescriber.hex16(index.name()) + ":" + keyPath(index.keyPath()) + ":" + (index.unique() ? 1 : 0) + ":" + (index.multiEntry() ? 1 : 0))
-                            .collect(Collectors.joining(","));
-                    actual.add(String.join("\t", "store", JsDescriber.hex16(name), JsDescriber.hex16(store.name()), keyPath(store.keyPath()),
-                            store.autoIncrement() ? "1" : "0", indexes));
-                    try (var records = database.records(store.name())) {
-                        for (var record : (Iterable<IdbRecord>) records::iterator) {
-                            actual.add(String.join("\t", "record", JsDescriber.hex16(name), JsDescriber.hex16(store.name()), key(record.key()),
-                                    JsDescriber.describe(record.value())));
-                        }
-                    }
+            contexts.add(context(line));
+        }
+        var actual = new ArrayList<String>();
+        var local = new ArrayList<String>();
+        for (var context : contexts) {
+            var prefix = context.isEmpty() ? "" : "@" + context + "\t";
+            var key = context.startsWith("partitioned:") ? StorageKey.partitioned(origin, context.substring("partitioned:".length())) : StorageKey.of(origin);
+            var bucket = context.startsWith("bucket:") ? new StorageBucket(key, context.substring("bucket:".length())) : StorageBucket.defaultOf(key);
+            assertTrue(profile.indexedDb().buckets().contains(bucket), bucket + " is not among the buckets " + profile.indexedDb().buckets());
+            for (var line : expected) {
+                if (!context(line).equals(context) || !content(line).startsWith("database\t")) {
+                    continue;
                 }
+                var name = unhex16(content(line).split("\t")[1]);
+                describe(profile, bucket, name, backend).forEach(described -> actual.add(prefix + described));
+            }
+            if (!context.startsWith("bucket:")) {
+                profile.localStorage().items(key).forEach((item, value) -> local.add(prefix + String.join("\t", "local", JsDescriber.hex16(item), JsDescriber.hex16(value))));
             }
         }
-        var local = new ArrayList<String>();
-        profile.localStorage(origin).forEach((key, value) -> local.add(String.join("\t", "local", JsDescriber.hex16(key), JsDescriber.hex16(value))));
         var session = new ArrayList<String>();
-        for (var area : profile.sessionStorage(origin)) {
+        for (var area : profile.sessionStorage().areas(origin)) {
             area.items().forEach((key, value) -> session.add(String.join("\t", "session", JsDescriber.hex16(key), JsDescriber.hex16(value))));
         }
 
-        compare("IndexedDB", expected.stream().filter(line -> !line.startsWith("local\t") && !line.startsWith("session\t")).toList(), actual);
-        compare("localStorage", expected.stream().filter(line -> line.startsWith("local\t")).sorted().toList(), local.stream().sorted().toList());
+        // Index entries are compared by ci/chrome/read.mjs, between Chrome's profile and a copy of it
+        compare("IndexedDB", expected.stream().filter(line -> !content(line).startsWith("local\t") && !content(line).startsWith("session\t")
+                && !content(line).startsWith("index\t")).toList(), actual);
+        compare("localStorage", expected.stream().filter(line -> content(line).startsWith("local\t")).sorted().toList(), local.stream().sorted().toList());
         compare("sessionStorage", expected.stream().filter(line -> line.startsWith("session\t")).sorted().toList(), session.stream().sorted().toList());
+    }
+
+    /// {@return the context a manifest line belongs to: what follows its `@`, or "" for the page's default bucket}
+    private static String context(String line) {
+        return line.startsWith("@") ? line.substring(1, line.indexOf('\t')) : "";
+    }
+
+    /// {@return a manifest line without its context}
+    private static String content(String line) {
+        return line.startsWith("@") ? line.substring(line.indexOf('\t') + 1) : line;
+    }
+
+    /// {@return the lines that describe the database `name` of `bucket`, as the page describes it}
+    private static List<String> describe(ChromiumProfile profile, StorageBucket bucket, String name, StorageBackend backend) throws IOException {
+        var lines = new ArrayList<String>();
+        try (var database = profile.indexedDb().open(bucket, name).orElseThrow(() -> new AssertionError("No database " + name + " in " + bucket))) {
+            assertEquals(backend, database.backend());
+            assertEquals(bucket, database.bucket());
+            lines.add(String.join("\t", "database", JsDescriber.hex16(name), Long.toString(database.version())));
+            var stores = new ArrayList<>(database.objectStores());
+            // DOMStringList, which objectStoreNames and indexNames are, sorts its names
+            stores.sort(Comparator.comparing(IdbObjectStore::name));
+            for (var store : stores) {
+                var indexes = store.indexes().stream()
+                        .sorted(Comparator.comparing(IdbIndex::name))
+                        .map(index -> JsDescriber.hex16(index.name()) + ":" + keyPath(index.keyPath()) + ":" + (index.unique() ? 1 : 0) + ":" + (index.multiEntry() ? 1 : 0))
+                        .collect(Collectors.joining(","));
+                lines.add(String.join("\t", "store", JsDescriber.hex16(name), JsDescriber.hex16(store.name()), keyPath(store.keyPath().orElse(null)),
+                        store.autoIncrement() ? "1" : "0", indexes));
+                try (var records = database.records(store.name())) {
+                    records.forEach(record -> lines.add(String.join("\t", "record", JsDescriber.hex16(name), JsDescriber.hex16(store.name()),
+                            key(record.key()), JsDescriber.describe(record.value()))));
+                }
+            }
+            for (var store : stores) {
+                var generator = database.keyGenerator(store.name());
+                if (generator.isPresent()) {
+                    lines.add(String.join("\t", "generator", JsDescriber.hex16(name), JsDescriber.hex16(store.name()), "N" + generator.getAsLong()));
+                }
+            }
+        }
+        return lines;
     }
 
     /// Fails on the first line that differs, showing both lines cut short, since a line may hold megabytes.

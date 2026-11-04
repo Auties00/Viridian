@@ -17,6 +17,8 @@ import java.io.ByteArrayOutputStream;
 record LevelDbKeys(long databaseId, long objectStoreId, long indexId, int length) {
     /// The index id of an object store's records.
     static final int OBJECT_STORE_DATA = 1;
+    /// The index id of an object store's record versions, which say a record exists.
+    static final int EXISTS_ENTRY = 2;
     /// The index id of an object store's blob entries.
     static final int BLOB_ENTRY = 3;
 

@@ -6,7 +6,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.util.Arrays;
 
-/// Reads the big-endian integers and varints of the SQLite file formats, and the files that hold them.
+/// Reads and writes the big-endian integers and varints of the SQLite file formats, and reads the files that hold them.
 ///
 /// A varint is one to nine bytes, most significant group first. Each of the first eight bytes contributes its low
 /// seven bits and continues the varint when its high bit is set; a ninth byte contributes all eight bits.
@@ -72,6 +72,55 @@ final class SqliteBytes {
             }
         }
         return value << 8 | data[offset + 8] & 0xFF;
+    }
+
+    /// Writes `value` as an unsigned big-endian 16-bit integer at `offset`.
+    static void putU16(byte[] data, int offset, int value) {
+        data[offset] = (byte) (value >>> 8);
+        data[offset + 1] = (byte) value;
+    }
+
+    /// Writes `value` as a big-endian 32-bit integer at `offset`.
+    static void putI32(byte[] data, int offset, int value) {
+        data[offset] = (byte) (value >>> 24);
+        data[offset + 1] = (byte) (value >>> 16);
+        data[offset + 2] = (byte) (value >>> 8);
+        data[offset + 3] = (byte) value;
+    }
+
+    /// {@return the number of bytes the varint of `value` takes, from 1 to 9}
+    ///
+    /// A value with any of its top eight bits set takes all nine bytes; any other takes one byte per seven bits.
+    static int varintLength(long value) {
+        if ((value & 0xFF00000000000000L) != 0) {
+            return 9;
+        }
+        var length = 1;
+        while ((value >>>= 7) != 0) {
+            length++;
+        }
+        return length;
+    }
+
+    /// Writes the varint of `value` at `offset`, in the shortest form SQLite writes.
+    ///
+    /// @return the offset just past the varint
+    static int putVarint(byte[] data, int offset, long value) {
+        if ((value & 0xFF00000000000000L) != 0) {
+            data[offset + 8] = (byte) value;
+            value >>>= 8;
+            for (var i = 7; i >= 0; i--) {
+                data[offset + i] = (byte) (value & 0x7F | 0x80);
+                value >>>= 7;
+            }
+            return offset + 9;
+        }
+        var length = varintLength(value);
+        for (var i = length - 1; i >= 0; i--) {
+            data[offset + i] = (byte) (value & 0x7F | (i == length - 1 ? 0 : 0x80));
+            value >>>= 7;
+        }
+        return offset + length;
     }
 
     /// Reads `length` bytes of `channel` at `position` into `destination`, zero-filling what lies past the end of the

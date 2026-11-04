@@ -1,7 +1,7 @@
 package com.github.auties00.viridian.domstorage;
 
 import com.github.auties00.viridian.SessionStorageArea;
-import com.github.auties00.viridian.StorageOrigin;
+import com.github.auties00.viridian.StorageKey;
 import com.github.auties00.viridian.ViridianException;
 import com.github.auties00.viridian.compress.Snappy;
 import com.github.auties00.viridian.compress.Zstd;
@@ -32,8 +32,9 @@ import java.util.TreeMap;
 ///
 /// Local Storage keeps one map per storage key, numbered by its row; its keys and values start with a format byte, as
 /// on LevelDB. Session Storage points each session and storage key at a map, which the sessions cloned from one
-/// another share; its keys are UTF-8 and its values little-endian UTF-16, as on LevelDB. A storage key is the origin
-/// with a trailing slash, such as `https://example.com/`. A value of 350 bytes or more may be compressed: its
+/// another share; its keys are UTF-8 and its values little-endian UTF-16, as on LevelDB. A storage key is its
+/// serialization, such as `https://example.com/` or `https://example.com/^0https://news.example`. A value of 350 bytes
+/// or more may be compressed: its
 /// compression type is 0 for none, 1 for zstd, 2 for Snappy.
 public final class SqliteDomStorage {
     // The backend's schema versions this reader knows
@@ -47,18 +48,18 @@ public final class SqliteDomStorage {
     private SqliteDomStorage() {
     }
 
-    /// {@return the `localStorage` items of `origin`, by key, from the Local Storage database `file`}
+    /// {@return the `localStorage` items of `key`, by key, from the Local Storage database `file`}
     ///
     /// @throws ViridianException if the schema is newer than this reader knows, or an item does not decode
     /// @throws IOException       if the database cannot be read
-    public static Map<String, String> localStorage(Path file, StorageOrigin origin) throws IOException {
+    public static Map<String, String> localStorage(Path file, StorageKey key) throws IOException {
         try (var database = open(file)) {
             var maps = table(database, "maps", file);
             var items = new TreeMap<String, String>();
             try (var cursor = maps.scan()) {
                 while (cursor.next()) {
                     var row = cursor.row();
-                    if (DomStorageText.isOrigin(storageKey(row, maps), origin)) {
+                    if (key.equals(DomStorageText.storageKey(storageKey(row, maps)))) {
                         var mapId = row.getLong(maps.columnIndex("row_id"));
                         for (var entry : entries(database, file, mapId).entrySet()) {
                             items.put(DomStorageText.decodeLocal(entry.getKey()), DomStorageText.decodeLocal(entry.getValue()));
@@ -70,11 +71,11 @@ public final class SqliteDomStorage {
         }
     }
 
-    /// {@return the origins with `localStorage` items in the Local Storage database `file`}
+    /// {@return the storage keys with `localStorage` items in the Local Storage database `file`}
     ///
     /// @throws ViridianException if the schema is newer than this reader knows
     /// @throws IOException       if the database cannot be read
-    public static List<StorageOrigin> localStorageOrigins(Path file) throws IOException {
+    public static List<StorageKey> localStorageKeys(Path file) throws IOException {
         try (var database = open(file)) {
             var maps = table(database, "maps", file);
             var storageKeys = new ArrayList<String>();
@@ -83,22 +84,39 @@ public final class SqliteDomStorage {
                     storageKeys.add(storageKey(cursor.row(), maps));
                 }
             }
-            return DomStorageText.origins(storageKeys);
+            return DomStorageText.storageKeys(storageKeys);
         }
     }
 
-    /// {@return the `sessionStorage` areas of `origin`, one per session, from the Session Storage database `file`}
+    /// {@return the storage keys with `sessionStorage` in the Session Storage database `file`}
+    ///
+    /// @throws ViridianException if the schema is newer than this reader knows
+    /// @throws IOException       if the database cannot be read
+    public static List<StorageKey> sessionStorageKeys(Path file) throws IOException {
+        try (var database = open(file)) {
+            var sessions = table(database, "session_metadata", file);
+            var storageKeys = new ArrayList<String>();
+            try (var cursor = sessions.scan()) {
+                while (cursor.next()) {
+                    storageKeys.add(storageKey(cursor.row(), sessions));
+                }
+            }
+            return DomStorageText.storageKeys(storageKeys);
+        }
+    }
+
+    /// {@return the `sessionStorage` areas of `key`, one per session, from the Session Storage database `file`}
     ///
     /// @throws ViridianException if the schema is newer than this reader knows, or a value does not decompress
     /// @throws IOException       if the database cannot be read
-    public static List<SessionStorageArea> sessionStorage(Path file, StorageOrigin origin) throws IOException {
+    public static List<SessionStorageArea> sessionStorage(Path file, StorageKey key) throws IOException {
         try (var database = open(file)) {
             var sessions = table(database, "session_metadata", file);
             var mapsBySession = new LinkedHashMap<String, Long>();
             try (var cursor = sessions.scan()) {
                 while (cursor.next()) {
                     var row = cursor.row();
-                    if (DomStorageText.isOrigin(storageKey(row, sessions), origin)) {
+                    if (key.equals(DomStorageText.storageKey(storageKey(row, sessions)))) {
                         mapsBySession.put(row.getText(sessions.columnIndex("session_id")), row.getLong(sessions.columnIndex("map_id")));
                     }
                 }
@@ -174,7 +192,7 @@ public final class SqliteDomStorage {
         }
     }
 
-    private static long version(Object value) {
+    static long version(Object value) {
         return switch (value) {
             case Long number -> number;
             case String text -> {

@@ -1,7 +1,8 @@
 package com.github.auties00.viridian.indexeddb;
 
-import com.github.auties00.viridian.IndexedDatabase;
+import com.github.auties00.viridian.IdbDatabaseReader;
 import com.github.auties00.viridian.StorageBackend;
+import com.github.auties00.viridian.StorageBucket;
 import com.github.auties00.viridian.StorageOrigin;
 
 import java.io.IOException;
@@ -16,28 +17,75 @@ import java.util.Optional;
 import java.util.TreeMap;
 import java.util.TreeSet;
 
-/// The `IndexedDB` directory of a profile: which origins have IndexedDB data, in which backend, and where.
+/// Where a profile keeps IndexedDB data, and what is there.
 ///
-/// An origin's LevelDB store is `<identifier>.indexeddb.leveldb`, with its blobs in `<identifier>.indexeddb.blob`;
-/// its SQLite databases are files of a directory named by the identifier alone, each named by the Base32 of the
-/// SHA-256 of the database name's UTF-16 code units, or `0` for the empty name. Chromium keeps an origin whose LevelDB
-/// store exists on LevelDB, and this reader does the same unless asked for a backend.
+/// The data of one storage bucket is a [Location]: a LevelDB store holding all of the bucket's databases, the
+/// directory of that store's blobs, and a directory of SQLite databases, one file per database, each named by the
+/// Base32 of the SHA-256 of the database name's UTF-16 code units, or `0` for the empty name. An origin's first-party
+/// default bucket keeps them in the profile's `IndexedDB` directory as `<identifier>.indexeddb.leveldb`,
+/// `<identifier>.indexeddb.blob` and `<identifier>`; any other bucket in its own directory, as `indexeddb.leveldb`,
+/// `indexeddb.blob` and the directory itself. Chromium keeps a bucket whose LevelDB store exists on LevelDB.
 public final class IndexedDbDirectory {
     private static final String LEVELDB_SUFFIX = ".indexeddb.leveldb";
     private static final String BLOB_SUFFIX = ".indexeddb.blob";
+    private static final String BUCKET_LEVELDB = "indexeddb.leveldb";
+    private static final String BUCKET_BLOBS = "indexeddb.blob";
     private static final String BASE32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
-    private final Path root;
-
-    /// Creates the view of `root`, the profile's `IndexedDB` directory, which need not exist.
-    public IndexedDbDirectory(Path root) {
-        this.root = root;
+    private IndexedDbDirectory() {
     }
 
-    /// {@return the origins with IndexedDB data, in either backend}
+    /// Where the IndexedDB data of one storage bucket is.
+    ///
+    /// @param levelDb the LevelDB store
+    /// @param blobs   the directory of the LevelDB store's blobs
+    /// @param sqlite  the directory of the SQLite databases, which may hold the other two
+    public record Location(Path levelDb, Path blobs, Path sqlite) {
+        /// {@return the location of the first-party default bucket of `origin` in `root`, a profile's `IndexedDB`
+        /// directory}
+        public static Location legacy(Path root, StorageOrigin origin) {
+            return new Location(root.resolve(origin.identifier() + LEVELDB_SUFFIX), root.resolve(origin.identifier() + BLOB_SUFFIX),
+                    root.resolve(origin.identifier()));
+        }
+
+        /// {@return the location of a bucket kept in `directory`, its `IndexedDB` directory under `WebStorage`}
+        public static Location bucket(Path directory) {
+            return new Location(directory.resolve(BUCKET_LEVELDB), directory.resolve(BUCKET_BLOBS), directory);
+        }
+
+        /// {@return the location with every path relative to `profile`}
+        public Location relativeTo(Path profile) {
+            return new Location(profile.relativize(levelDb), profile.relativize(blobs), profile.relativize(sqlite));
+        }
+
+        /// {@return whether `backend` holds data here: a LevelDB store, or at least one SQLite database}
+        public boolean has(StorageBackend backend) throws IOException {
+            return switch (backend) {
+                case LEVELDB -> Files.isDirectory(levelDb);
+                case SQLITE -> !sqliteFiles(sqlite).isEmpty();
+            };
+        }
+
+        /// {@return the backend Chromium reads here: LevelDB when its store exists, else SQLite when it has a database,
+        /// else none}
+        public Optional<StorageBackend> backend() throws IOException {
+            if (has(StorageBackend.LEVELDB)) {
+                return Optional.of(StorageBackend.LEVELDB);
+            }
+            return has(StorageBackend.SQLITE) ? Optional.of(StorageBackend.SQLITE) : Optional.empty();
+        }
+
+        /// {@return the SQLite file of the database `name`}
+        public Path sqliteFile(String name) {
+            return sqlite.resolve(sqliteFileName(name));
+        }
+    }
+
+    /// {@return the origins whose first-party default bucket has IndexedDB data in `root`, a profile's `IndexedDB`
+    /// directory, in either backend}
     ///
     /// @throws IOException if the directory cannot be listed
-    public List<StorageOrigin> origins() throws IOException {
+    public static List<StorageOrigin> origins(Path root) throws IOException {
         var identifiers = new TreeSet<String>();
         if (!Files.isDirectory(root)) {
             return List.of();
@@ -57,75 +105,89 @@ public final class IndexedDbDirectory {
             try {
                 origins.add(StorageOrigin.ofIdentifier(identifier));
             } catch (IllegalArgumentException _) {
-                // Not an origin's storage: a bucket directory, or a name this reader does not know
+                // Not an origin's storage, or a name this reader does not know
             }
         }
         return origins;
     }
 
-    /// {@return the backend that holds `origin`'s data, or an empty optional if it has none}
+    /// {@return the databases at `location` in `backend`, open, by name; the caller closes them}
     ///
-    /// @throws IOException if the directory cannot be listed
-    public Optional<StorageBackend> backend(StorageOrigin origin) throws IOException {
-        if (Files.isDirectory(levelDbDirectory(origin))) {
-            return Optional.of(StorageBackend.LEVELDB);
-        }
-        var sqlite = root.resolve(origin.identifier());
-        return Files.isDirectory(sqlite) && !sqliteFiles(sqlite).isEmpty() ? Optional.of(StorageBackend.SQLITE) : Optional.empty();
-    }
-
-    /// {@return the names of `origin`'s databases in `backend`, sorted}
+    /// A database a page created but failed to open is left out, as Chromium leaves it out.
     ///
+    /// @param bucket the bucket the databases belong to
     /// @throws IOException if the files cannot be read, or the metadata does not decode
-    public List<String> names(StorageOrigin origin, StorageBackend backend) throws IOException {
-        var names = new TreeSet<String>();
-        switch (backend) {
-            case LEVELDB -> {
-                if (Files.isDirectory(levelDbDirectory(origin))) {
-                    for (var database : LevelDbIndexedDatabase.openAll(levelDbDirectory(origin), blobDirectory(origin), origin)) {
-                        names.add(database.name());
+    public static List<IdbDatabaseReader> openAll(Location location, StorageBucket bucket, StorageBackend backend) throws IOException {
+        var readers = new TreeMap<String, IdbDatabaseReader>();
+        try {
+            switch (backend) {
+                case LEVELDB -> {
+                    if (Files.isDirectory(location.levelDb())) {
+                        for (var database : LevelDbDatabaseReader.openAll(location.levelDb(), location.blobs(), bucket)) {
+                            readers.put(database.name(), database);
+                        }
                     }
                 }
-            }
-            case SQLITE -> {
-                var directory = root.resolve(origin.identifier());
-                if (Files.isDirectory(directory)) {
-                    for (var file : sqliteFiles(directory)) {
-                        try (var database = SqliteIndexedDatabase.open(file, origin)) {
-                            if (database.version() > 0) {
-                                names.add(database.name());
-                            }
+                case SQLITE -> {
+                    for (var file : sqliteFiles(location.sqlite())) {
+                        var database = SqliteDatabaseReader.open(file, bucket);
+                        if (database.version() > 0) {
+                            readers.put(database.name(), database);
+                        } else {
+                            database.close();
                         }
                     }
                 }
             }
+        } catch (IOException | RuntimeException failure) {
+            for (var reader : readers.values()) {
+                try {
+                    reader.close();
+                } catch (IOException closing) {
+                    failure.addSuppressed(closing);
+                }
+            }
+            throw failure;
+        }
+        return List.copyOf(readers.values());
+    }
+
+    /// {@return the names of the databases at `location` in `backend`, sorted}
+    ///
+    /// @throws IOException if the files cannot be read, or the metadata does not decode
+    public static List<String> names(Location location, StorageBucket bucket, StorageBackend backend) throws IOException {
+        var names = new ArrayList<String>();
+        for (var reader : openAll(location, bucket, backend)) {
+            names.add(reader.name());
+            reader.close();
         }
         return List.copyOf(names);
     }
 
-    /// {@return the database `name` of `origin` in `backend`, open, or an empty optional if there is none}
+    /// {@return the database `name` at `location` in `backend`, open, or an empty optional if there is none}
     ///
     /// @throws IOException if the files cannot be read, or the metadata does not decode
-    public Optional<IndexedDatabase> open(StorageOrigin origin, String name, StorageBackend backend) throws IOException {
+    public static Optional<IdbDatabaseReader> open(Location location, StorageBucket bucket, String name, StorageBackend backend)
+            throws IOException {
         return switch (backend) {
             case LEVELDB -> {
-                if (!Files.isDirectory(levelDbDirectory(origin))) {
-                    yield Optional.empty();
-                }
-                for (var database : LevelDbIndexedDatabase.openAll(levelDbDirectory(origin), blobDirectory(origin), origin)) {
-                    if (database.name().equals(name)) {
-                        yield Optional.of(database);
+                IdbDatabaseReader found = null;
+                for (var database : openAll(location, bucket, backend)) {
+                    if (found == null && database.name().equals(name)) {
+                        found = database;
+                    } else {
+                        database.close();
                     }
                 }
-                yield Optional.empty();
+                yield Optional.ofNullable(found);
             }
             case SQLITE -> {
-                var file = root.resolve(origin.identifier()).resolve(sqliteFileName(name));
+                var file = location.sqliteFile(name);
                 if (!Files.isRegularFile(file)) {
                     yield Optional.empty();
                 }
-                var database = SqliteIndexedDatabase.open(file, origin);
-                if (!database.name().equals(name)) {
+                var database = SqliteDatabaseReader.open(file, bucket);
+                if (!database.name().equals(name) || database.version() == 0) {
                     database.close();
                     yield Optional.empty();
                 }
@@ -134,22 +196,16 @@ public final class IndexedDbDirectory {
         };
     }
 
-    private Path levelDbDirectory(StorageOrigin origin) {
-        return root.resolve(origin.identifier() + LEVELDB_SUFFIX);
-    }
-
-    private Path blobDirectory(StorageOrigin origin) {
-        return root.resolve(origin.identifier() + BLOB_SUFFIX);
-    }
-
-    /// {@return the database files of an origin's SQLite directory, sidecars and blob directories left out}
-    private static List<Path> sqliteFiles(Path directory) throws IOException {
+    /// {@return the database files of a SQLite directory, sidecars and blob directories left out}
+    public static List<Path> sqliteFiles(Path directory) throws IOException {
+        if (!Files.isDirectory(directory)) {
+            return List.of();
+        }
         var files = new TreeMap<String, Path>();
         try (var entries = Files.list(directory)) {
             for (var entry : (Iterable<Path>) entries::iterator) {
                 var name = entry.getFileName().toString();
-                if (Files.isRegularFile(entry) && !name.endsWith("-wal") && !name.endsWith("-shm") && !name.endsWith("-journal")
-                        && (name.equals("0") || isBase32Digest(name))) {
+                if (Files.isRegularFile(entry) && (name.equals("0") || isBase32Digest(name))) {
                     files.put(name, entry);
                 }
             }

@@ -3,6 +3,7 @@ package com.github.auties00.viridian.value;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
+import java.util.Objects;
 
 /// A view of a [JsArrayBuffer]: a typed array, such as a `Uint8Array`, or a `DataView`.
 ///
@@ -23,14 +24,59 @@ public final class JsArrayBufferView implements JsValue {
         this.lengthTracking = lengthTracking;
     }
 
-    /// {@return a view of `kind` over all of `buffer`}
+    /// {@return a `Uint8Array` over a new buffer holding a copy of `bytes`, as `new Uint8Array(bytes)` makes}
+    public static JsArrayBufferView uint8(byte[] bytes) {
+        return of(Kind.UINT8, JsArrayBuffer.of(bytes));
+    }
+
+    /// {@return a view of `kind` over all of `buffer`, of a fixed length even if the buffer is resizable}
     ///
     /// @throws IllegalArgumentException if the buffer's length is not a multiple of the kind's element size
     public static JsArrayBufferView of(Kind kind, JsArrayBuffer buffer) {
-        if (buffer.byteLength() % kind.elementSize() != 0) {
-            throw new IllegalArgumentException("A " + kind + " needs a multiple of " + kind.elementSize() + " bytes: " + buffer.byteLength());
+        return of(kind, buffer, 0, buffer.byteLength());
+    }
+
+    /// {@return a view of `kind` over the `byteLength` bytes of `buffer` from `byteOffset`, of a fixed length even if
+    /// the buffer is resizable}
+    ///
+    /// The range is in bytes for every kind, so a `Uint32Array` of 2 elements at the start of a buffer is
+    /// `of(Kind.UINT32, buffer, 0, 8)`.
+    ///
+    /// @throws IllegalArgumentException if the range is not within the buffer, or the offset or the length is not a
+    ///                                  multiple of the kind's element size
+    public static JsArrayBufferView of(Kind kind, JsArrayBuffer buffer, int byteOffset, int byteLength) {
+        Objects.requireNonNull(kind, "kind");
+        Objects.requireNonNull(buffer, "buffer");
+        if (byteOffset < 0 || byteLength < 0 || byteOffset > buffer.byteLength() || byteLength > buffer.byteLength() - byteOffset) {
+            throw new IllegalArgumentException("A view of " + byteLength + " bytes at " + byteOffset + " is not within a buffer of " + buffer.byteLength());
         }
-        return new JsArrayBufferView(kind, buffer, 0, buffer.byteLength(), false);
+        checkAlignment(kind, byteOffset, byteLength);
+        return new JsArrayBufferView(kind, buffer, byteOffset, byteLength, false);
+    }
+
+    /// {@return a view of `kind` over a resizable `buffer` from `byteOffset`, which follows the buffer's length, as
+    /// `new Uint8Array(buffer, byteOffset)` makes over a resizable buffer}
+    ///
+    /// @throws IllegalArgumentException if the buffer is not resizable, the offset is past its end, or the offset is
+    ///                                  not a multiple of the kind's element size
+    public static JsArrayBufferView ofLengthTracking(Kind kind, JsArrayBuffer buffer, int byteOffset) {
+        Objects.requireNonNull(kind, "kind");
+        Objects.requireNonNull(buffer, "buffer");
+        if (buffer.maxByteLength().isEmpty()) {
+            throw new IllegalArgumentException("Only a view of a resizable buffer can follow its length");
+        }
+        if (byteOffset < 0 || byteOffset > buffer.byteLength()) {
+            throw new IllegalArgumentException("A view at " + byteOffset + " is not within a buffer of " + buffer.byteLength());
+        }
+        checkAlignment(kind, byteOffset, 0);
+        return new JsArrayBufferView(kind, buffer, byteOffset, 0, true);
+    }
+
+    private static void checkAlignment(Kind kind, int byteOffset, int byteLength) {
+        if (byteOffset % kind.elementSize() != 0 || byteLength % kind.elementSize() != 0) {
+            throw new IllegalArgumentException("A " + kind.typeName() + " needs an offset and a length that are multiples of "
+                    + kind.elementSize() + " bytes: " + byteOffset + " and " + byteLength);
+        }
     }
 
     /// {@return the kind of view}
@@ -48,10 +94,11 @@ public final class JsArrayBufferView implements JsValue {
         return byteOffset;
     }
 
-    /// {@return how many bytes the view covers: for a length-tracking view, what its buffer holds past its offset}
+    /// {@return how many bytes the view covers: for a length-tracking view, the whole elements its buffer holds past
+    /// its offset}
     public int byteLength() {
         // V8 records 0 for a length-tracking view, whose length is its buffer's
-        return lengthTracking ? Math.max(0, buffer.byteLength() - byteOffset) : byteLength;
+        return lengthTracking ? Math.max(0, buffer.byteLength() - byteOffset) / kind.elementSize() * kind.elementSize() : byteLength;
     }
 
     /// {@return how many elements the view has: its bytes for a `DataView`}

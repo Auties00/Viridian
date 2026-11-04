@@ -6,7 +6,7 @@ import java.util.Objects;
 /// A JavaScript BigInt primitive.
 ///
 /// @param value the integer
-public record JsBigInt(BigInteger value) implements JsValue {
+public record JsBigInt(BigInteger value) implements JsPrimitive {
     /// Creates a BigInt.
     public JsBigInt {
         Objects.requireNonNull(value, "value");

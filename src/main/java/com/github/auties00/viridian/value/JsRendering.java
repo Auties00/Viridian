@@ -43,7 +43,7 @@ final class JsRendering {
                 case JsArray array -> {
                     output.append('[');
                     var shown = 0;
-                    for (var entry : array.presentElements().entrySet()) {
+                    for (var entry : array.elements().entrySet()) {
                         if (shown > 0) {
                             output.append(", ");
                         }
@@ -56,7 +56,7 @@ final class JsRendering {
                         }
                         render(entry.getValue(), output, enclosing, depth + 1);
                     }
-                    if (array.presentElements().size() < array.length() && !array.isSparse()) {
+                    if (array.elements().size() < array.length() && !array.isSparse()) {
                         output.append(shown > 0 ? ", " : "").append("<holes>");
                     }
                     output.append(']');

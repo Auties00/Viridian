@@ -1,7 +1,7 @@
 package com.github.auties00.viridian.domstorage;
 
 import com.github.auties00.viridian.SessionStorageArea;
-import com.github.auties00.viridian.StorageOrigin;
+import com.github.auties00.viridian.StorageKey;
 import com.github.auties00.viridian.ViridianException;
 import com.github.auties00.viridian.leveldb.LevelDb;
 
@@ -20,19 +20,21 @@ import java.util.TreeSet;
 /// Reads Chromium's DOM Storage on its LevelDB backend: `localStorage` and `sessionStorage`, each a LevelDB database
 /// of the profile.
 ///
-/// Local Storage (`Local Storage/leveldb`) keys an item by `_`, the origin, a 0 byte and the item's key, which like
-/// the value starts with a format byte; the other keys (`VERSION`, `META:<origin>`, `METAACCESS:<origin>`) are
-/// bookkeeping.
+/// Local Storage (`Local Storage/leveldb`) keys an item by `_`, the storage key, a 0 byte and the item's key, which
+/// like the value starts with a format byte; the other keys (`VERSION`, `META:<storage key>`,
+/// `METAACCESS:<storage key>`) are bookkeeping. A first-party storage key is its origin alone, a partitioned one its
+/// whole serialization:
 ///
 /// ```text
-/// "_https://example.com" 00 01 "theme"    -> 01 "dark"
+/// "_https://example.com" 00 01 "theme"                            -> 01 "dark"
+/// "_https://example.com/^0https://news.example" 00 01 "theme"     -> 01 "light"
 /// ```
 ///
-/// Session Storage (`Session Storage`) maps each session and origin to a numbered map, whose items hold their keys as
-/// UTF-8 and their values as little-endian UTF-16, without a format byte:
+/// Session Storage (`Session Storage`) maps each session and storage key to a numbered map, whose items hold their
+/// keys as UTF-8 and their values as little-endian UTF-16, without a format byte:
 ///
 /// ```text
-/// "namespace-<session id>-<origin>/"      -> "<map number>"
+/// "namespace-<session id>-<storage key>"  -> "<map number>"
 /// "map-<map number>-" <key, UTF-8>        -> <value, UTF-16LE>
 /// ```
 public final class LevelDbDomStorage {
@@ -44,13 +46,13 @@ public final class LevelDbDomStorage {
     private LevelDbDomStorage() {
     }
 
-    /// {@return the `localStorage` items of `origin`, by key, from the Local Storage database in `directory`}
+    /// {@return the `localStorage` items of `key`, by key, from the Local Storage database in `directory`}
     ///
     /// @throws ViridianException if an item does not decode
     /// @throws IOException       if the database cannot be read
-    public static Map<String, String> localStorage(Path directory, StorageOrigin origin) throws IOException {
-        var prefix = ("_" + origin.serialize()).getBytes(StandardCharsets.ISO_8859_1);
-        var entries = LevelDb.read(directory, key -> key.length > prefix.length && matchesItemOrigin(key, prefix));
+    public static Map<String, String> localStorage(Path directory, StorageKey key) throws IOException {
+        var prefix = ("_" + key.serializeForLocalStorage()).getBytes(StandardCharsets.ISO_8859_1);
+        var entries = LevelDb.read(directory, candidate -> candidate.length > prefix.length && matchesItemOrigin(candidate, prefix));
         var items = new TreeMap<String, String>();
         for (var entry : entries) {
             var separator = indexOf(entry.key(), (byte) 0, 1);
@@ -60,10 +62,10 @@ public final class LevelDbDomStorage {
         return items;
     }
 
-    /// {@return the origins with `localStorage` items in the Local Storage database in `directory`}
+    /// {@return the storage keys with `localStorage` items in the Local Storage database in `directory`}
     ///
     /// @throws IOException if the database cannot be read
-    public static List<StorageOrigin> localStorageOrigins(Path directory) throws IOException {
+    public static List<StorageKey> localStorageKeys(Path directory) throws IOException {
         var storageKeys = new TreeSet<String>();
         for (var entry : LevelDb.read(directory, key -> key.length > 1 && key[0] == '_')) {
             var separator = indexOf(entry.key(), (byte) 0, 1);
@@ -71,15 +73,29 @@ public final class LevelDbDomStorage {
                 storageKeys.add(new String(entry.key(), 1, separator - 1, StandardCharsets.ISO_8859_1));
             }
         }
-        return DomStorageText.origins(storageKeys);
+        return DomStorageText.storageKeys(storageKeys);
     }
 
-    /// {@return the `sessionStorage` areas of `origin`, one per session, from the Session Storage database in
+    /// {@return the storage keys with `sessionStorage` in the Session Storage database in `directory`}
+    ///
+    /// @throws IOException if the database cannot be read
+    public static List<StorageKey> sessionStorageKeys(Path directory) throws IOException {
+        var storageKeys = new TreeSet<String>();
+        for (var entry : LevelDb.read(directory, key -> startsWith(key, NAMESPACE_PREFIX))) {
+            if (entry.key().length > NAMESPACE_PREFIX.length + NAMESPACE_ID_LENGTH + 1) {
+                storageKeys.add(new String(entry.key(), NAMESPACE_PREFIX.length + NAMESPACE_ID_LENGTH + 1,
+                        entry.key().length - NAMESPACE_PREFIX.length - NAMESPACE_ID_LENGTH - 1, StandardCharsets.ISO_8859_1));
+            }
+        }
+        return DomStorageText.storageKeys(storageKeys);
+    }
+
+    /// {@return the `sessionStorage` areas of `key`, one per session, from the Session Storage database in
     /// `directory`}
     ///
     /// @throws IOException if the database cannot be read
-    public static List<SessionStorageArea> sessionStorage(Path directory, StorageOrigin origin) throws IOException {
-        var entries = LevelDb.read(directory, key -> startsWith(key, NAMESPACE_PREFIX) || startsWith(key, MAP_PREFIX));
+    public static List<SessionStorageArea> sessionStorage(Path directory, StorageKey key) throws IOException {
+        var entries = LevelDb.read(directory, candidate -> startsWith(candidate, NAMESPACE_PREFIX) || startsWith(candidate, MAP_PREFIX));
         var mapsBySession = new LinkedHashMap<String, String>();
         for (var entry : entries) {
             if (!startsWith(entry.key(), NAMESPACE_PREFIX) || entry.key().length <= NAMESPACE_PREFIX.length + NAMESPACE_ID_LENGTH + 1) {
@@ -88,7 +104,7 @@ public final class LevelDbDomStorage {
             var namespace = new String(entry.key(), NAMESPACE_PREFIX.length, NAMESPACE_ID_LENGTH, StandardCharsets.US_ASCII);
             var storageKey = new String(entry.key(), NAMESPACE_PREFIX.length + NAMESPACE_ID_LENGTH + 1,
                     entry.key().length - NAMESPACE_PREFIX.length - NAMESPACE_ID_LENGTH - 1, StandardCharsets.ISO_8859_1);
-            if (DomStorageText.isOrigin(storageKey, origin)) {
+            if (key.equals(DomStorageText.storageKey(storageKey))) {
                 mapsBySession.put(namespace, new String(entry.value(), StandardCharsets.US_ASCII).strip());
             }
         }
@@ -105,8 +121,8 @@ public final class LevelDbDomStorage {
             if (!mapsBySession.containsValue(map)) {
                 continue;
             }
-            var key = new String(entry.key(), separator + 1, entry.key().length - separator - 1, StandardCharsets.UTF_8);
-            itemsByMap.computeIfAbsent(map, _ -> new TreeMap<>()).put(key, DomStorageText.utf16(entry.value(), 0));
+            var item = new String(entry.key(), separator + 1, entry.key().length - separator - 1, StandardCharsets.UTF_8);
+            itemsByMap.computeIfAbsent(map, _ -> new TreeMap<>()).put(item, DomStorageText.utf16(entry.value(), 0));
         }
         var areas = new ArrayList<SessionStorageArea>();
         for (var session : mapsBySession.entrySet()) {

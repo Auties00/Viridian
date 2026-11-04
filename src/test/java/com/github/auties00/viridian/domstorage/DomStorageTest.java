@@ -3,6 +3,7 @@ package com.github.auties00.viridian.domstorage;
 import com.github.auties00.viridian.ChromiumProfile;
 import com.github.auties00.viridian.SessionStorageArea;
 import com.github.auties00.viridian.StorageBackend;
+import com.github.auties00.viridian.StorageKey;
 import com.github.auties00.viridian.StorageOrigin;
 import com.github.auties00.viridian.ViridianException;
 import com.github.auties00.viridian.leveldb.LevelDbWriter;
@@ -103,11 +104,12 @@ class DomStorageTest {
                     .put(concat(ascii("_https://example.com"), new byte[]{0}, local("greeting", true)), local(NI_HAO, true))
                     .put(concat(ascii("_https://example.com.evil"), new byte[]{0}, local("theme", false)), local("light", false))
                     .put(concat(ascii("_https://other.com"), new byte[]{0}, local("x", false)), local("y", false))
-                    .put(concat(ascii("_https://example.com^0https://top.com"), new byte[]{0}, local("partitioned", false)), local("z", false))
+                    .put(concat(ascii("_https://example.com/^0https://top.com"), new byte[]{0}, local("partitioned", false)), local("z", false))
                     .writeLog(directory, 3);
-            assertEquals(Map.of("theme", "dark", "greeting", NI_HAO), LevelDbDomStorage.localStorage(directory, ORIGIN));
-            assertEquals(List.of(StorageOrigin.parse("https://example.com"), StorageOrigin.parse("https://example.com.evil"),
-                    StorageOrigin.parse("https://other.com")), LevelDbDomStorage.localStorageOrigins(directory));
+            assertEquals(Map.of("theme", "dark", "greeting", NI_HAO), LevelDbDomStorage.localStorage(directory, StorageKey.of(ORIGIN)));
+            assertEquals(List.of(StorageKey.of(StorageOrigin.parse("https://example.com.evil")), StorageKey.of(ORIGIN),
+                    StorageKey.partitioned(ORIGIN, "https://top.com"), StorageKey.of(StorageOrigin.parse("https://other.com"))), LevelDbDomStorage.localStorageKeys(directory));
+            assertEquals(Map.of("partitioned", "z"), LevelDbDomStorage.localStorage(directory, StorageKey.partitioned(ORIGIN, "https://top.com")));
         }
 
         @Test
@@ -124,7 +126,7 @@ class DomStorageTest {
                     .put(concat(ascii("map-0-"), "secret".getBytes(StandardCharsets.UTF_8)), "no".getBytes(StandardCharsets.UTF_16LE))
                     .writeLog(directory, 3);
             assertEquals(List.of(new SessionStorageArea(FIRST_SESSION, Map.of(STEP, "1")), new SessionStorageArea(SECOND_SESSION, Map.of(STEP, NI_HAO))),
-                    LevelDbDomStorage.sessionStorage(directory, ORIGIN));
+                    LevelDbDomStorage.sessionStorage(directory, StorageKey.of(ORIGIN)));
         }
     }
 
@@ -151,9 +153,10 @@ class DomStorageTest {
                 insert(connection, entry, 3, 0, local("partitioned", false), local("z", false));
                 insert(connection, entry, 4, 0, local("x", false), local("y", false));
             });
-            assertEquals(Map.of("theme", "dark", "greeting", NI_HAO, "zstd", long1, "snappy", long2), SqliteDomStorage.localStorage(file, ORIGIN));
-            assertEquals(List.of(StorageOrigin.parse("https://example.com"), StorageOrigin.parse("https://example.com.evil"),
-                    StorageOrigin.parse("https://other.com")), SqliteDomStorage.localStorageOrigins(file));
+            assertEquals(Map.of("theme", "dark", "greeting", NI_HAO, "zstd", long1, "snappy", long2), SqliteDomStorage.localStorage(file, StorageKey.of(ORIGIN)));
+            assertEquals(List.of(StorageKey.of(StorageOrigin.parse("https://example.com.evil")), StorageKey.of(ORIGIN),
+                    StorageKey.partitioned(ORIGIN, "https://top.com"), StorageKey.of(StorageOrigin.parse("https://other.com"))), SqliteDomStorage.localStorageKeys(file));
+            assertEquals(Map.of("partitioned", "z"), SqliteDomStorage.localStorage(file, StorageKey.partitioned(ORIGIN, "https://top.com")));
         }
 
         @Test
@@ -173,7 +176,7 @@ class DomStorageTest {
             });
             // Sessions come in session id order, as on LevelDB
             assertEquals(List.of(new SessionStorageArea(FIRST_SESSION, Map.of(STEP, "1")), new SessionStorageArea(THIRD_SESSION, Map.of(STEP, NI_HAO)),
-                    new SessionStorageArea(SECOND_SESSION, Map.of(STEP, "1"))), SqliteDomStorage.sessionStorage(file, ORIGIN));
+                    new SessionStorageArea(SECOND_SESSION, Map.of(STEP, "1"))), SqliteDomStorage.sessionStorage(file, StorageKey.of(ORIGIN)));
         }
 
         @Test
@@ -185,7 +188,7 @@ class DomStorageTest {
                     statement.execute("UPDATE meta SET value = '2' WHERE key = 'last_compatible_version'");
                 }
             });
-            var failure = assertThrows(ViridianException.class, () -> SqliteDomStorage.localStorage(file, ORIGIN));
+            var failure = assertThrows(ViridianException.class, () -> SqliteDomStorage.localStorage(file, StorageKey.of(ORIGIN)));
             assertEquals(ViridianException.Reason.UNSUPPORTED, failure.reason());
         }
     }
@@ -197,19 +200,19 @@ class DomStorageTest {
                 .put(concat(ascii("_https://example.com"), new byte[]{0}, local("from", false)), local("leveldb", false))
                 .writeLog(profileDirectory.resolve("Local Storage").resolve("leveldb"), 3);
         var profile = ChromiumProfile.open(profileDirectory);
-        assertEquals(Optional.of(StorageBackend.LEVELDB), profile.localStorageBackend());
-        assertEquals(Optional.empty(), profile.sessionStorageBackend());
-        assertEquals(Map.of("from", "leveldb"), profile.localStorage(ORIGIN));
+        assertEquals(Optional.of(StorageBackend.LEVELDB), profile.localStorage().backend());
+        assertEquals(Optional.empty(), profile.sessionStorage().backend());
+        assertEquals(Map.of("from", "leveldb"), profile.localStorage().items(ORIGIN));
 
         sqlite(profileDirectory.resolve("LocalStorage"), LOCAL_STORAGE_SCHEMA, connection -> {
             insert(connection, "INSERT INTO maps(storage_key, last_accessed, last_modified, total_size) VALUES (?, 1, 1, 0)", ascii("https://example.com/"));
             insert(connection, "INSERT INTO map_entries VALUES (?, ?, ?, ?)", 1, 0, local("from", false), local("sqlite", false));
         });
-        assertEquals(Optional.of(StorageBackend.SQLITE), profile.localStorageBackend());
-        assertEquals(Map.of("from", "sqlite"), profile.localStorage(ORIGIN));
-        assertEquals(Map.of("from", "leveldb"), profile.localStorage(ORIGIN, StorageBackend.LEVELDB));
-        assertEquals(List.of(ORIGIN), profile.localStorageOrigins());
+        assertEquals(Optional.of(StorageBackend.SQLITE), profile.localStorage().backend());
+        assertEquals(Map.of("from", "sqlite"), profile.localStorage().items(ORIGIN));
+        assertEquals(Map.of("from", "leveldb"), profile.localStorage(StorageBackend.LEVELDB).items(ORIGIN));
+        assertEquals(List.of(ORIGIN), profile.localStorage().origins());
         Files.delete(profileDirectory.resolve("LocalStorage"));
-        assertEquals(Optional.of(StorageBackend.LEVELDB), profile.localStorageBackend());
+        assertEquals(Optional.of(StorageBackend.LEVELDB), profile.localStorage().backend());
     }
 }

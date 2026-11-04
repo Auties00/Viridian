@@ -6,7 +6,10 @@ package com.github.auties00.viridian.value;
 /// [Double#equals(Object)] has it.
 ///
 /// @param value the number
-public record JsNumber(double value) implements JsValue {
+public record JsNumber(double value) implements JsPrimitive {
+    // The largest integer every smaller one of which a double holds exactly: 2^53
+    static final long MAX_SAFE_INTEGER = 1L << 53;
+
     /// {@return whether the number is an integer that a `long` holds exactly}
     public boolean isLong() {
         return value == Math.rint(value) && value >= -0x1p63 && value < 0x1p63 && !(value == 0 && 1 / value < 0);

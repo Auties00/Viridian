@@ -2,6 +2,7 @@ package com.github.auties00.viridian.leveldb;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -57,26 +58,13 @@ public final class LevelDbWriter {
     /// {@return `records` framed in 32 KiB log blocks, those that cross a block boundary fragmented}
     public static byte[] logRecords(List<byte[]> records) {
         var out = new ByteArrayOutputStream();
-        for (var record : records) {
-            var offset = 0;
-            var first = true;
-            do {
-                var leftover = LevelDbLog.BLOCK_SIZE - out.size() % LevelDbLog.BLOCK_SIZE;
-                if (leftover < 7) {
-                    out.writeBytes(new byte[leftover]);
-                    leftover = LevelDbLog.BLOCK_SIZE;
-                }
-                var length = Math.min(record.length - offset, leftover - 7);
-                var last = offset + length == record.length;
-                var type = first && last ? 1 : first ? 2 : last ? 4 : 3;
-                writeFixed32(out, LevelDb.maskedCrc((byte) type, record, offset, length));
-                out.write(length & 0xFF);
-                out.write(length >>> 8);
-                out.write(type);
-                out.write(record, offset, length);
-                offset += length;
-                first = false;
-            } while (offset < record.length);
+        var log = new LevelDbLogWriter(out);
+        try {
+            for (var record : records) {
+                log.addRecord(record, 0, record.length);
+            }
+        } catch (IOException exception) {
+            throw new UncheckedIOException(exception);
         }
         return out.toByteArray();
     }

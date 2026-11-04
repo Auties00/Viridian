@@ -7,6 +7,8 @@ final class JsNumbers {
     // The regular expression flags in the order V8 lists them, with their bits
     private static final char[] FLAG_CHARACTERS = {'d', 'g', 'i', 'l', 'm', 's', 'u', 'v', 'y'};
     private static final int[] FLAG_BITS = {7, 0, 1, 6, 2, 5, 4, 8, 3};
+    // The bits of the u and v flags, which exclude each other
+    static final int UNICODE_FLAGS = 1 << 4 | 1 << 8;
 
     private JsNumbers() {
     }
@@ -47,6 +49,34 @@ final class JsNumbers {
             }
         }
         return flags.toString();
+    }
+
+    /// {@return V8's flag bits for the flags string of a regular expression, in any order}
+    ///
+    /// @throws IllegalArgumentException if a flag is unknown or repeated, or `u` and `v` are both set, which
+    ///                                  JavaScript rejects
+    static int regExpBits(String flags) {
+        var bits = 0;
+        for (var i = 0; i < flags.length(); i++) {
+            var flag = flags.charAt(i);
+            var bit = -1;
+            for (var j = 0; j < FLAG_CHARACTERS.length; j++) {
+                if (FLAG_CHARACTERS[j] == flag) {
+                    bit = 1 << FLAG_BITS[j];
+                }
+            }
+            if (bit == -1) {
+                throw new IllegalArgumentException("Unknown regular expression flag '" + flag + "' in \"" + flags + "\"");
+            }
+            if ((bits & bit) != 0) {
+                throw new IllegalArgumentException("Repeated regular expression flag '" + flag + "' in \"" + flags + "\"");
+            }
+            bits |= bit;
+        }
+        if ((bits & UNICODE_FLAGS) == UNICODE_FLAGS) {
+            throw new IllegalArgumentException("A regular expression cannot have both the u and v flags: \"" + flags + "\"");
+        }
+        return bits;
     }
 
     /// {@return the shortest decimal that rounds to `value`, positive and finite, the closest of them if several}

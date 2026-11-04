@@ -38,8 +38,8 @@ class StructuredCloneTest {
         @Test
         @DisplayName("undefined, null and booleans")
         void constants() throws ViridianException {
-            assertSame(JsUndefined.INSTANCE, decode(V8Writer.blink().tag('_')));
-            assertSame(JsNull.INSTANCE, decode(V8Writer.blink().tag('0')));
+            assertSame(JsValue.UNDEFINED, decode(V8Writer.blink().tag('_')));
+            assertSame(JsValue.NULL, decode(V8Writer.blink().tag('0')));
             assertEquals(JsBoolean.TRUE, decode(V8Writer.blink().tag('T')));
             assertEquals(JsBoolean.FALSE, decode(V8Writer.blink().tag('F')));
         }
@@ -212,8 +212,7 @@ class StructuredCloneTest {
         void aesKey() throws ViridianException {
             var key = assertInstanceOf(JsCryptoKey.class, decode(V8Writer.blink().tag('\\').tag('K')
                     .raw(1).varint(9).varint(16).varint(1 | 1 << 1 | 1 << 2).varint(16).raw(new byte[16])));
-            assertEquals(JsCryptoKey.Algorithm.AES_GCM, key.algorithm());
-            assertEquals(128, key.length().orElseThrow());
+            assertEquals(new KeyAlgorithm.Aes(KeyAlgorithm.Aes.Name.AES_GCM, 128), key.algorithm());
             assertEquals(EnumSet.of(JsCryptoKey.Usage.ENCRYPT, JsCryptoKey.Usage.DECRYPT), key.usages());
             assertTrue(key.extractable());
             assertEquals(JsCryptoKey.KeyDataFormat.RAW, key.keyDataFormat());
@@ -223,39 +222,37 @@ class StructuredCloneTest {
         @DisplayName("HMAC, RSA, EC, Ed25519 and parameterless keys")
         void otherKeys() throws ViridianException {
             var hmac = assertInstanceOf(JsCryptoKey.class, decode(V8Writer.blink().tag('\\').tag('K').raw(2).varint(32).varint(6).varint(1 << 3).varint(32).raw(new byte[32])));
-            assertEquals(JsCryptoKey.Algorithm.SHA_256, hmac.hash().orElseThrow());
+            assertEquals(new KeyAlgorithm.Hmac(KeyAlgorithm.Hash.SHA_256, 256), hmac.algorithm());
             assertFalse(hmac.extractable());
             var rsa = assertInstanceOf(JsCryptoKey.class, decode(V8Writer.blink().tag('\\').tag('K')
                     .raw(4).varint(13).varint(2).varint(2048).varint(3).raw(new byte[]{1, 0, 1}).varint(6).varint(1 << 3).varint(4).raw(new byte[4])));
             assertEquals(JsCryptoKey.Type.PRIVATE, rsa.type());
             assertEquals(JsCryptoKey.KeyDataFormat.PKCS8, rsa.keyDataFormat());
-            assertArrayEquals(new byte[]{1, 0, 1}, rsa.publicExponent().orElseThrow());
+            assertEquals(new KeyAlgorithm.RsaHashed(KeyAlgorithm.RsaHashed.Name.RSA_PSS, 2048, BigInteger.valueOf(65537), KeyAlgorithm.Hash.SHA_256),
+                    rsa.algorithm());
             var ec = assertInstanceOf(JsCryptoKey.class, decode(V8Writer.blink().tag('\\').tag('K').raw(5).varint(14).varint(1).varint(2).varint(1 << 4).varint(2).raw(new byte[2])));
-            assertEquals(JsCryptoKey.NamedCurve.P_384, ec.namedCurve().orElseThrow());
+            assertEquals(new KeyAlgorithm.Ec(KeyAlgorithm.Ec.Name.ECDSA, KeyAlgorithm.NamedCurve.P_384), ec.algorithm());
             assertEquals(JsCryptoKey.KeyDataFormat.SPKI, ec.keyDataFormat());
-            assertEquals(JsCryptoKey.Algorithm.ED25519, assertInstanceOf(JsCryptoKey.class, decode(V8Writer.blink().tag('\\').tag('K')
+            assertEquals(new KeyAlgorithm.Basic(KeyAlgorithm.Basic.Name.ED25519), assertInstanceOf(JsCryptoKey.class, decode(V8Writer.blink().tag('\\').tag('K')
                     .raw(7).varint(18).varint(1).varint(0).varint(1).raw(new byte[1]))).algorithm());
-            assertEquals(JsCryptoKey.Algorithm.HKDF, assertInstanceOf(JsCryptoKey.class, decode(V8Writer.blink().tag('\\').tag('K')
+            assertEquals(new KeyAlgorithm.Basic(KeyAlgorithm.Basic.Name.HKDF), assertInstanceOf(JsCryptoKey.class, decode(V8Writer.blink().tag('\\').tag('K')
                     .raw(6).varint(16).varint(1 << 5).varint(1).raw(new byte[1]))).algorithm());
-            assertEquals(JsCryptoKey.Algorithm.ML_DSA_65, assertInstanceOf(JsCryptoKey.class, decode(V8Writer.blink().tag('\\').tag('K')
+            assertEquals(new KeyAlgorithm.Basic(KeyAlgorithm.Basic.Name.ML_DSA_65), assertInstanceOf(JsCryptoKey.class, decode(V8Writer.blink().tag('\\').tag('K')
                     .raw(9).varint(22).varint(2).varint(1 << 3).varint(1).raw(new byte[1]))).algorithm());
         }
 
         @Test
-        @DisplayName("blobs and files by index resolve to the external objects, their bytes included")
+        @DisplayName("blobs and files by index resolve to the blobs stored beside the value, their bytes included")
         void blobs() throws Exception {
-            var externals = List.<ExternalObject>of(
-                    new ExternalObject.Blob("text/plain", 3, () -> new ByteArrayInputStream(new byte[]{1, 2, 3})),
-                    new ExternalObject.FileSystemAccessHandle(new byte[]{9}),
-                    new ExternalObject.File("photo.png", "image/png", 2, Instant.EPOCH, () -> new ByteArrayInputStream(new byte[]{4, 5})));
+            var blobs = List.of(
+                    new JsBlob("text/plain", 3, () -> new ByteArrayInputStream(new byte[]{1, 2, 3})),
+                    new JsFile("photo.png", "image/png", 2, Instant.EPOCH, () -> new ByteArrayInputStream(new byte[]{4, 5})));
             var data = V8Writer.blink().tag('A').varint(2).tag('\\').tag('i').varint(0).tag('\\').tag('e').varint(1).tag('$').varint(0).varint(2).toByteArray();
-            var array = assertInstanceOf(JsArray.class, StructuredClone.deserialize(data, 0, data.length, externals));
+            var array = assertInstanceOf(JsArray.class, StructuredClone.deserialize(data, blobs));
             var blob = assertInstanceOf(JsBlob.class, array.get(0).orElseThrow());
-            try (var stream = blob.open()) {
-                assertArrayEquals(new byte[]{1, 2, 3}, stream.readAllBytes());
-            }
-            // The handle does not count: file index 1 is the second blob or file
-            assertEquals("photo.png", assertInstanceOf(JsFile.class, array.get(1).orElseThrow()).name());
+            assertSame(blobs.getFirst(), blob);
+            assertArrayEquals(new byte[]{1, 2, 3}, blob.readAllBytes());
+            assertSame(blobs.getLast(), array.get(1).orElseThrow());
             assertEquals(ViridianException.Reason.MISSING, failure(V8Writer.blink().tag('\\').tag('i').varint(0)));
         }
 
@@ -271,7 +268,10 @@ class StructuredCloneTest {
             assertTrue(assertInstanceOf(JsDomMatrix.class, decode(V8Writer.blink().tag('\\').tag('I').f64(1).f64(0).f64(0).f64(1).f64(0).f64(0))).is2D());
             assertEquals(new JsDomException("NotFoundError", "gone"), decode(V8Writer.blink().tag('\\').tag('x')
                     .blinkString("NotFoundError").blinkString("gone").blinkString("stack")));
-            assertEquals(new JsFileSystemHandle(JsFileSystemHandle.Kind.DIRECTORY, "docs"), decode(V8Writer.blink().tag('\\').tag('N').blinkString("docs").varint(0)));
+            var handle = assertInstanceOf(JsFileSystemHandle.class, decode(V8Writer.blink().tag('\\').tag('N').blinkString("docs").varint(0)));
+            assertEquals(JsFileSystemHandle.Kind.DIRECTORY, handle.kind());
+            assertEquals("docs", handle.name());
+            assertTrue(handle.token().isEmpty());
             assertInstanceOf(JsRtcCertificate.class, decode(V8Writer.blink().tag('\\').tag('k').blinkString("key").blinkString("cert")));
         }
 
@@ -339,7 +339,7 @@ class StructuredCloneTest {
                 }
                 var length = random.nextInt(4) == 0 ? random.nextInt(data.length + 1) : data.length;
                 try {
-                    StructuredClone.deserialize(data, 0, length, List.of());
+                    StructuredClone.deserialize(java.util.Arrays.copyOf(data, length));
                 } catch (ViridianException _) {
                     // The expected failure for damaged data
                 }

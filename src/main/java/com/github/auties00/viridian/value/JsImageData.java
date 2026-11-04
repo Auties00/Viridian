@@ -4,6 +4,9 @@ import java.util.Objects;
 
 /// An `ImageData`: its size, color space, pixel format and pixels.
 public final class JsImageData implements JsHostObject {
+    // Chromium refuses image data of more pixel bytes than a typed array holds, 2^32 elements
+    private static final long MAX_BYTES = 1L << 32;
+
     private final int width;
     private final int height;
     private final JsColorSpace colorSpace;
@@ -16,6 +19,32 @@ public final class JsImageData implements JsHostObject {
         this.colorSpace = Objects.requireNonNull(colorSpace, "colorSpace");
         this.pixelFormat = Objects.requireNonNull(pixelFormat, "pixelFormat");
         this.pixels = pixels;
+    }
+
+    /// {@return an sRGB `rgba-unorm8` image of `width` by `height` pixels, 4 bytes each, a copy of `pixels`}
+    ///
+    /// @throws IllegalArgumentException if a side is not positive, or `pixels` is not 4 bytes a pixel
+    public static JsImageData of(int width, int height, byte[] pixels) {
+        return of(width, height, JsColorSpace.SRGB, PixelFormat.RGBA_UNORM8, pixels);
+    }
+
+    /// {@return an image of `width` by `height` pixels in `colorSpace`, each stored in `pixelFormat`, a copy of
+    /// `pixels`}
+    ///
+    /// @param pixels the pixels, row by row from the top; each component of a float format is little-endian
+    /// @throws IllegalArgumentException if a side is not positive, or `pixels` is not the size the format calls for
+    public static JsImageData of(int width, int height, JsColorSpace colorSpace, PixelFormat pixelFormat, byte[] pixels) {
+        Objects.requireNonNull(colorSpace, "colorSpace");
+        Objects.requireNonNull(pixelFormat, "pixelFormat");
+        if (width <= 0 || height <= 0) {
+            throw new IllegalArgumentException("An ImageData of " + width + "x" + height + " pixels has no pixels");
+        }
+        var expected = (long) width * height * pixelFormat.bytesPerPixel();
+        if (expected > MAX_BYTES || pixels.length != expected) {
+            throw new IllegalArgumentException("An ImageData of " + width + "x" + height + " " + pixelFormat.webName()
+                    + " pixels takes " + expected + " bytes, not " + pixels.length);
+        }
+        return new JsImageData(width, height, colorSpace, pixelFormat, pixels.clone());
     }
 
     /// {@return the width in pixels}
@@ -43,6 +72,11 @@ public final class JsImageData implements JsHostObject {
         return pixels.clone();
     }
 
+    /// {@return the pixels themselves}
+    byte[] rawPixels() {
+        return pixels;
+    }
+
     @Override
     public String toString() {
         return "ImageData(" + width + "x" + height + ")";
@@ -68,6 +102,16 @@ public final class JsImageData implements JsHostObject {
         /// {@return the name the canvas APIs use for the format}
         public String webName() {
             return webName;
+        }
+
+        /// {@return the code Blink serializes for the format}
+        int code() {
+            return code;
+        }
+
+        /// {@return how many bytes a pixel takes}
+        int bytesPerPixel() {
+            return 4 << code;
         }
 
         /// {@return the format of Blink code `code`, or `null` for a code it does not know}

@@ -1,5 +1,6 @@
 package com.github.auties00.viridian.value;
 
+import java.util.Objects;
 import java.util.Optional;
 
 /// An `ImageBitmap`: its size, how its pixels are stored and oriented, and the pixels.
@@ -25,6 +26,31 @@ public final class JsImageBitmap implements JsHostObject {
         this.premultiplied = premultiplied;
         this.orientation = orientation;
         this.pixels = pixels;
+    }
+
+    /// {@return a bitmap of `width` by `height` pixels in `colorSpace`, stored in `pixelFormat` and oriented by
+    /// `orientation`, a copy of `pixels`}
+    ///
+    /// @param pixels the pixels as stored, row by row from the top, before the orientation applies
+    /// @throws IllegalArgumentException if a side is not positive, the format is the obsolete
+    ///                                  [PixelFormat#NATIVE8], or `pixels` is not the size the format calls for
+    public static JsImageBitmap of(int width, int height, JsColorSpace colorSpace, PixelFormat pixelFormat, boolean opaque,
+                                   boolean premultiplied, Orientation orientation, byte[] pixels) {
+        Objects.requireNonNull(colorSpace, "colorSpace");
+        Objects.requireNonNull(pixelFormat, "pixelFormat");
+        Objects.requireNonNull(orientation, "orientation");
+        if (pixelFormat == PixelFormat.NATIVE8) {
+            throw new IllegalArgumentException("The native pixel format is obsolete: name the byte order");
+        }
+        if (width <= 0 || height <= 0) {
+            throw new IllegalArgumentException("An ImageBitmap of " + width + "x" + height + " pixels has no pixels");
+        }
+        var expected = (long) width * height * pixelFormat.bytesPerPixel();
+        if (pixels.length != expected) {
+            throw new IllegalArgumentException("An ImageBitmap of " + width + "x" + height + " pixels in " + pixelFormat
+                    + " takes " + expected + " bytes, not " + pixels.length);
+        }
+        return new JsImageBitmap(width, height, colorSpace, null, pixelFormat, opaque, premultiplied, orientation, pixels.clone());
     }
 
     /// {@return the width in pixels}
@@ -76,6 +102,16 @@ public final class JsImageBitmap implements JsHostObject {
         return pixels.clone();
     }
 
+    /// {@return the parametric color space itself, or `null`}
+    double[] rawParametricColorSpace() {
+        return parametricColorSpace;
+    }
+
+    /// {@return the pixels themselves}
+    byte[] rawPixels() {
+        return pixels;
+    }
+
     @Override
     public String toString() {
         return "ImageBitmap(" + width + "x" + height + ")";
@@ -98,6 +134,16 @@ public final class JsImageBitmap implements JsHostObject {
 
         PixelFormat(int code) {
             this.code = code;
+        }
+
+        /// {@return the code Blink serializes for the format}
+        int code() {
+            return code;
+        }
+
+        /// {@return how many bytes a pixel takes}
+        int bytesPerPixel() {
+            return this == F16 ? 8 : 4;
         }
 
         /// {@return the format of Blink code `code`, or `null` for a code it does not know}

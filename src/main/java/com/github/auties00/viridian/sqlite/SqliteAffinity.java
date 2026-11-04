@@ -9,6 +9,7 @@ import java.util.regex.Pattern;
 /// Reading a file needs affinity twice. A REAL column stores a value with no fractional part as an INTEGER to save
 /// space, and SQLite converts it back as it reads it, so a reader must too. A record written before
 /// `ALTER TABLE ADD COLUMN` lacks the new column, which reads as its `DEFAULT` converted by the column's affinity.
+/// Writing a file converts every value it stores, as [#store(Object)] does.
 ///
 /// @spec https://www.sqlite.org/datatype3.html Datatypes In SQLite
 enum SqliteAffinity {
@@ -110,6 +111,44 @@ enum SqliteAffinity {
             value = fromNumber(negate(numerify(value)));
         }
         return value;
+    }
+
+    /// {@return `value` as SQLite stores it in a column of this affinity: `null`, a [Long], a [Double], a [String] or a
+    /// `byte[]`}
+    ///
+    /// `value` is one of those types, and never a NaN, which SQLite stores as `NULL`. A BLOB is never converted. A TEXT
+    /// column stores an integer as its decimal text. The numeric affinities store text that is a well-formed number
+    /// as that number, and a REAL with an integer value strictly inside the `long` range as an INTEGER. A REAL column
+    /// then keeps an INTEGER of at most six bytes, from -2^47 to 2^47 - 1, as it is, the INTEGER that reads back as a
+    /// REAL, and stores any larger INTEGER as the nearest REAL.
+    ///
+    /// @throws IllegalArgumentException if `value` is a REAL and this is the TEXT affinity: the text SQLite renders a
+    ///                                  REAL as depends on its version, so no conversion matches every SQLite
+    Object store(Object value) {
+        return switch (this) {
+            case BLOB -> value;
+            case TEXT -> switch (value) {
+                case Long integer -> Long.toString(integer);
+                case Double _ -> throw new IllegalArgumentException("A REAL stored in a TEXT column becomes text whose form "
+                        + "depends on the SQLite version; store the text instead");
+                case null, default -> value;
+            };
+            case NUMERIC, INTEGER -> numeric(value);
+            case REAL -> {
+                var stored = numeric(value);
+                yield stored instanceof Long integer && (integer < -(1L << 47) || integer >= 1L << 47) ? (Object) (double) integer : stored;
+            }
+        };
+    }
+
+    /// {@return `value` converted by the numeric affinities: text that is a well-formed number becomes that number,
+    /// and a REAL with an integer value strictly inside the `long` range an INTEGER}
+    private static Object numeric(Object value) {
+        return switch (value) {
+            case Double real -> integral(real);
+            case String text -> numeric(text, true);
+            case null, default -> value;
+        };
     }
 
     /// {@return the integer `value` converted by this affinity}

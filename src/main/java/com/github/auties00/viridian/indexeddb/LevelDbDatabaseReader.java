@@ -1,18 +1,20 @@
 package com.github.auties00.viridian.indexeddb;
 
+import com.github.auties00.viridian.IdbDatabaseReader;
 import com.github.auties00.viridian.IdbIndex;
 import com.github.auties00.viridian.IdbKey;
 import com.github.auties00.viridian.IdbKeyPath;
 import com.github.auties00.viridian.IdbObjectStore;
 import com.github.auties00.viridian.IdbRecord;
-import com.github.auties00.viridian.IndexedDatabase;
 import com.github.auties00.viridian.StorageBackend;
-import com.github.auties00.viridian.StorageOrigin;
+import com.github.auties00.viridian.StorageBucket;
 import com.github.auties00.viridian.ViridianException;
 import com.github.auties00.viridian.io.ByteCursor;
 import com.github.auties00.viridian.leveldb.LevelDb;
 import com.github.auties00.viridian.value.BlobSource;
-import com.github.auties00.viridian.value.ExternalObject;
+import com.github.auties00.viridian.io.ValueAccess;
+import com.github.auties00.viridian.value.JsBlob;
+import com.github.auties00.viridian.value.JsValue;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -24,8 +26,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.TreeMap;
 import java.util.stream.Stream;
 
@@ -34,11 +39,11 @@ import java.util.stream.Stream;
 ///
 /// Opening a database reads its metadata; each read of an object store reads the origin's LevelDB files again,
 /// keeping only that store's records, which it sorts by key since the backend's key encoding is not byte-ordered.
-/// The database holds no file open between calls.
+/// The reader holds no file open between calls.
 ///
 /// A record's blobs are files of the origin's blob directory, `<database id>/<second byte of the blob number>/<blob
 /// number>` in lowercase hexadecimal.
-public final class LevelDbIndexedDatabase implements IndexedDatabase {
+public final class LevelDbDatabaseReader implements IdbDatabaseReader, DatabaseSource {
     // Global metadata types
     private static final int SCHEMA_VERSION = 0;
     private static final int DATABASE_NAME = 201;
@@ -51,6 +56,7 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
     private static final int STORE_KEY_PATH = 1;
     private static final int STORE_AUTO_INCREMENT = 2;
     private static final int STORE_HAS_KEY_PATH = 6;
+    private static final int STORE_KEY_GENERATOR = 7;
     // Index metadata types
     private static final int INDEX_NAME = 0;
     private static final int INDEX_UNIQUE = 1;
@@ -65,24 +71,37 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
 
     private final Path directory;
     private final Path blobDirectory;
-    private final StorageOrigin origin;
+    private final StorageBucket bucket;
     private final String name;
     private final long databaseId;
     private final long version;
     private final List<IdbObjectStore> objectStores;
+    // The id and key generator of each object store, by name
+    private final Map<String, Long> storeIds;
+    private final Map<String, Long> keyGenerators;
     private final boolean legacyExternalObjects;
     private boolean closed;
 
-    private LevelDbIndexedDatabase(Path directory, Path blobDirectory, StorageOrigin origin, String name, long databaseId,
-                                   long version, List<IdbObjectStore> objectStores, boolean legacyExternalObjects) {
+    private LevelDbDatabaseReader(Path directory, Path blobDirectory, StorageBucket bucket, String name, long databaseId,
+                                  long version, Map<String, StoreBuilder> stores, boolean legacyExternalObjects) throws IOException {
         this.directory = directory;
         this.blobDirectory = blobDirectory;
-        this.origin = origin;
+        this.bucket = bucket;
         this.name = name;
         this.databaseId = databaseId;
         this.version = version;
-        this.objectStores = objectStores;
         this.legacyExternalObjects = legacyExternalObjects;
+        var objectStores = new ArrayList<IdbObjectStore>();
+        this.storeIds = new LinkedHashMap<>();
+        this.keyGenerators = new LinkedHashMap<>();
+        for (var store : stores.values()) {
+            objectStores.add(store.build(name));
+            storeIds.put(store.name, store.id);
+            if (store.autoIncrement) {
+                keyGenerators.put(store.name, store.keyGenerator);
+            }
+        }
+        this.objectStores = List.copyOf(objectStores);
     }
 
     /// {@return every database of the origin in the LevelDB `directory`, by name}
@@ -90,7 +109,7 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
     /// @param blobDirectory the origin's blob directory, which need not exist
     /// @throws NoSuchFileException if `directory` holds no LevelDB database
     /// @throws IOException         if the files cannot be read, or the metadata does not decode
-    public static List<LevelDbIndexedDatabase> openAll(Path directory, Path blobDirectory, StorageOrigin origin) throws IOException {
+    public static List<LevelDbDatabaseReader> openAll(Path directory, Path blobDirectory, StorageBucket bucket) throws IOException {
         var metadata = LevelDb.read(directory, key -> {
             var prefix = LevelDbKeys.decode(key);
             return prefix != null && prefix.isMetadata();
@@ -120,9 +139,9 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
                 databaseEntries.computeIfAbsent(prefix.databaseId(), _ -> new ArrayList<>()).add(entry);
             }
         }
-        var databases = new ArrayList<LevelDbIndexedDatabase>();
+        var databases = new ArrayList<LevelDbDatabaseReader>();
         for (var named : databaseIds.entrySet()) {
-            var database = parseDatabase(directory, blobDirectory, origin, named.getKey(), named.getValue(),
+            var database = parseDatabase(directory, blobDirectory, bucket, named.getKey(), named.getValue(),
                     databaseEntries.getOrDefault(named.getValue(), List.of()), schemaVersion < EXTERNAL_OBJECTS_V4_SCHEMA);
             if (database != null) {
                 databases.add(database);
@@ -132,7 +151,7 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
     }
 
     /// {@return the database the metadata entries describe, or `null` for one a page failed to open}
-    private static LevelDbIndexedDatabase parseDatabase(Path directory, Path blobDirectory, StorageOrigin origin, String name,
+    private static LevelDbDatabaseReader parseDatabase(Path directory, Path blobDirectory, StorageBucket bucket, String name,
                                                         long databaseId, List<LevelDb.Entry> entries, boolean legacyExternalObjects)
             throws IOException {
         var version = DEFAULT_VERSION;
@@ -155,6 +174,7 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
                         case STORE_KEY_PATH -> store.keyPath = keyPath(entry.value());
                         case STORE_AUTO_INCREMENT -> store.autoIncrement = littleEndianInt(entry.value()) != 0;
                         case STORE_HAS_KEY_PATH -> store.hasKeyPath = entry.value().length > 0 && entry.value()[0] != 0;
+                        case STORE_KEY_GENERATOR -> store.keyGenerator = littleEndianInt(entry.value());
                         default -> {
                         }
                     }
@@ -181,19 +201,18 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
         if (version == DEFAULT_VERSION) {
             return null;
         }
-        var objectStores = new ArrayList<IdbObjectStore>();
+        var named = new LinkedHashMap<String, StoreBuilder>();
         for (var store : stores.values()) {
             if (store.name != null) {
-                objectStores.add(store.build());
+                named.put(store.name, store);
             }
         }
-        return new LevelDbIndexedDatabase(directory, blobDirectory, origin, name, databaseId, version, List.copyOf(objectStores),
-                legacyExternalObjects);
+        return new LevelDbDatabaseReader(directory, blobDirectory, bucket, name, databaseId, version, named, legacyExternalObjects);
     }
 
     @Override
-    public StorageOrigin origin() {
-        return origin;
+    public StorageBucket bucket() {
+        return bucket;
     }
 
     @Override
@@ -217,9 +236,40 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
     }
 
     @Override
-    public Stream<IdbRecord> records(String store) throws IOException {
+    public OptionalLong keyGenerator(String store) {
+        requireStore(store);
+        var generator = keyGenerators.get(store);
+        return generator == null ? OptionalLong.empty() : OptionalLong.of(generator);
+    }
+
+    @Override
+    public OptionalLong keyGenerator(IdbObjectStore store) {
+        return keyGenerator(store.name());
+    }
+
+    @Override
+    public long count(String store) throws IOException {
         ensureOpen();
-        var storeId = requireStore(store).id();
+        var dataPrefix = LevelDbKeys.encode(databaseId, requireStoreId(store), LevelDbKeys.OBJECT_STORE_DATA);
+        return LevelDb.read(directory, key -> startsWith(key, dataPrefix)).size();
+    }
+
+    @Override
+    public Optional<JsValue> get(String store, IdbKey key) throws IOException {
+        var record = record(store, key);
+        return record.isEmpty() ? Optional.empty() : Optional.of(record.get().value(requireStore(store)));
+    }
+
+    @Override
+    public Stream<IdbRecord> records(String store) throws IOException {
+        return StoredCursor.stream(openCursor(store));
+    }
+
+    @Override
+    public StoredCursor openCursor(String store) throws IOException {
+        ensureOpen();
+        var definition = requireStore(store);
+        var storeId = requireStoreId(store);
         var dataPrefix = LevelDbKeys.encode(databaseId, storeId, LevelDbKeys.OBJECT_STORE_DATA);
         var blobPrefix = LevelDbKeys.encode(databaseId, storeId, LevelDbKeys.BLOB_ENTRY);
         var entries = LevelDb.read(directory, key -> startsWith(key, dataPrefix) || startsWith(key, blobPrefix));
@@ -229,21 +279,41 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
                 blobEntries.put(new KeyBytes(Arrays.copyOfRange(entry.key(), blobPrefix.length, entry.key().length)), entry.value());
             }
         }
-        var records = new ArrayList<StoredRecord>();
+        // Keys are decoded up front to sort them; values are left to decode as the cursor reaches them
+        var keyed = new ArrayList<Keyed>();
         for (var entry : entries) {
             if (entry.startsWith(dataPrefix)) {
                 var encodedKey = Arrays.copyOfRange(entry.key(), dataPrefix.length, entry.key().length);
-                records.add(record(encodedKey, entry.value(), blobEntries.get(new KeyBytes(encodedKey))));
+                keyed.add(new Keyed(decodeKey(encodedKey), encodedKey, entry.value()));
             }
         }
-        records.sort(Comparator.comparing(StoredRecord::key));
-        return records.stream().map(IdbRecord.class::cast);
+        keyed.sort(Comparator.comparing(Keyed::key));
+        var iterator = keyed.iterator();
+        return new StoredCursor(new StoredCursor.Records() {
+            @Override
+            public StoredRecord next() throws IOException {
+                if (!iterator.hasNext()) {
+                    return null;
+                }
+                var next = iterator.next();
+                return record(next.key(), next.value(), blobEntries.get(new KeyBytes(next.encodedKey())));
+            }
+
+            @Override
+            public void close() {
+            }
+        }, definition);
     }
 
     @Override
-    public Optional<IdbRecord> record(String store, IdbKey key) throws IOException {
+    public RecordCursor records(IdbObjectStore store) throws IOException {
+        return StoredCursor.stored(openCursor(store.name()));
+    }
+
+    /// {@return the record of `store` with key `key`, or an empty optional if there is none}
+    private Optional<StoredRecord> record(String store, IdbKey key) throws IOException {
         ensureOpen();
-        var storeId = requireStore(store).id();
+        var storeId = requireStoreId(store);
         var encodedKey = IdbKeyCodec.encodeLevelDb(key);
         var dataKey = concat(LevelDbKeys.encode(databaseId, storeId, LevelDbKeys.OBJECT_STORE_DATA), encodedKey);
         var blobKey = concat(LevelDbKeys.encode(databaseId, storeId, LevelDbKeys.BLOB_ENTRY), encodedKey);
@@ -257,44 +327,53 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
                 blobs = entry.value();
             }
         }
-        return value == null ? Optional.empty() : Optional.of(record(encodedKey, value, blobs));
+        return value == null ? Optional.empty() : Optional.of(record(key, value, blobs));
     }
 
-    /// {@return the record of an encoded key, its stored value and its blob entry, if any}
-    private StoredRecord record(byte[] encodedKey, byte[] value, byte[] blobEntry) throws IOException {
-        IdbKey key;
+    /// {@return the key an encoded key holds}
+    private IdbKey decodeKey(byte[] encodedKey) throws ViridianException {
         try {
-            key = IdbKeyCodec.decodeLevelDb(new ByteCursor(encodedKey));
-        } catch (IOException exception) {
+            return IdbKeyCodec.decodeLevelDb(new ByteCursor(encodedKey));
+        } catch (IOException | IllegalArgumentException exception) {
             throw new ViridianException(ViridianException.Reason.CORRUPTED, "A record key of " + name + " does not decode", exception);
         }
+    }
+
+    /// {@return the record of a key, its stored value and its blob entry, if any}
+    private StoredRecord record(IdbKey key, byte[] value, byte[] blobEntry) throws IOException {
         var input = new ByteCursor(value);
         // The record's version, which Chromium uses to match index entries to it
         input.varint64();
-        var externals = blobEntry == null ? List.<ExternalObject>of() : externalObjects(blobEntry);
-        return new StoredRecord(key, externals, value, input.position());
+        var blobs = new ArrayList<JsBlob>();
+        var tokens = new ArrayList<byte[]>();
+        if (blobEntry != null) {
+            externalObjects(blobEntry, blobs, tokens);
+        }
+        return new StoredRecord(key, blobs, tokens, value, input.position());
     }
 
-    /// {@return the external objects a blob entry lists}
+    /// Reads the blobs, files and File System Access tokens a blob entry lists.
     ///
     /// From schema version 4 an object is a type byte (0 blob, 1 file, 2 File System Access handle), then for a blob
     /// or file a varint blob number, the MIME type as a length-prefixed UTF-16BE string and a varint size, and for a
     /// file its name the same way and a varint modification time in microseconds since 1601; for a handle, its
     /// varint-prefixed token. Before, an object was a file flag byte, a blob number, a type, then a name for a file
     /// or a size for a blob.
-    private List<ExternalObject> externalObjects(byte[] blobEntry) throws IOException {
+    private void externalObjects(byte[] blobEntry, List<JsBlob> blobs, List<byte[]> tokens) throws IOException {
+        var access = ValueAccess.get();
         var input = new ByteCursor(blobEntry);
-        var objects = new ArrayList<ExternalObject>();
         while (input.hasRemaining()) {
             if (legacyExternalObjects) {
                 var isFile = input.u8() != 0;
                 var blobNumber = input.varint64();
                 var type = IdbKeyCodec.readUtf16BigEndian(input, input.varintLength());
                 if (isFile) {
+                    // The older encoding records no size for a file, which its file on disk has
                     var fileName = IdbKeyCodec.readUtf16BigEndian(input, input.varintLength());
-                    objects.add(new ExternalObject.File(fileName, type, -1, null, blobFile(blobNumber)));
+                    var file = blobPath(blobNumber);
+                    blobs.add(access.file(fileName, type, Files.isRegularFile(file) ? Files.size(file) : 0, null, blobFile(blobNumber)));
                 } else {
-                    objects.add(new ExternalObject.Blob(type, input.varint64(), blobFile(blobNumber)));
+                    blobs.add(access.blob(type, input.varint64(), blobFile(blobNumber)));
                 }
                 continue;
             }
@@ -305,25 +384,29 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
                     var type = IdbKeyCodec.readUtf16BigEndian(input, input.varintLength());
                     var size = input.varint64();
                     if (objectType == 0) {
-                        objects.add(new ExternalObject.Blob(type, size, blobFile(blobNumber)));
+                        blobs.add(access.blob(type, size, blobFile(blobNumber)));
                     } else {
                         var fileName = IdbKeyCodec.readUtf16BigEndian(input, input.varintLength());
                         var modified = WINDOWS_EPOCH.plus(input.varint64(), ChronoUnit.MICROS);
-                        objects.add(new ExternalObject.File(fileName, type, size, modified, blobFile(blobNumber)));
+                        blobs.add(access.file(fileName, type, size, modified, blobFile(blobNumber)));
                     }
                 }
-                case 2 -> objects.add(new ExternalObject.FileSystemAccessHandle(input.lengthPrefixed()));
+                case 2 -> tokens.add(input.lengthPrefixed());
                 default -> throw new ViridianException(ViridianException.Reason.CORRUPTED, "A blob entry of " + name + " has object type " + objectType);
             }
         }
-        return objects;
+    }
+
+    /// {@return the file of blob `blobNumber`}
+    private Path blobPath(long blobNumber) {
+        return blobDirectory.resolve(Long.toHexString(databaseId))
+                .resolve(String.format("%02x", (blobNumber >>> 8) & 0xFF))
+                .resolve(Long.toHexString(blobNumber));
     }
 
     /// {@return where the bytes of blob `blobNumber` are}
     private BlobSource blobFile(long blobNumber) {
-        var file = blobDirectory.resolve(Long.toHexString(databaseId))
-                .resolve(String.format("%02x", (blobNumber >>> 8) & 0xFF))
-                .resolve(Long.toHexString(blobNumber));
+        var file = blobPath(blobNumber);
         return () -> {
             try {
                 return Files.newInputStream(file);
@@ -335,6 +418,11 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
 
     private IdbObjectStore requireStore(String store) {
         return objectStore(store).orElseThrow(() -> new IllegalArgumentException("The database " + name + " has no object store " + store));
+    }
+
+    private long requireStoreId(String store) {
+        requireStore(store);
+        return storeIds.get(store);
     }
 
     private void ensureOpen() {
@@ -350,7 +438,7 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
 
     @Override
     public String toString() {
-        return "IndexedDatabase[" + origin + ", " + name + ", LevelDB]";
+        return "IdbDatabaseReader[" + bucket + ", " + name + ", LevelDB]";
     }
 
     /// {@return the key path an encoded key path holds}
@@ -358,6 +446,14 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
     /// A typed key path is `00 00` and a type byte: 0 none, 1 a string with its length, 2 a varint count of strings.
     /// Anything else is a legacy key path, the whole value a UTF-16BE string.
     private static IdbKeyPath keyPath(byte[] value) throws IOException {
+        try {
+            return decodeKeyPath(value);
+        } catch (IllegalArgumentException exception) {
+            throw new IOException("A key path is not valid", exception);
+        }
+    }
+
+    private static IdbKeyPath decodeKeyPath(byte[] value) throws IOException {
         if (value.length < 3 || value[0] != 0 || value[1] != 0) {
             return new IdbKeyPath.Single(utf16BigEndian(value));
         }
@@ -410,21 +506,37 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
         private IdbKeyPath keyPath;
         private Boolean hasKeyPath;
         private boolean autoIncrement;
+        // kKeyGeneratorInitialNumber, which a store of an old schema without the entry starts from
+        private long keyGenerator = 1;
 
         StoreBuilder(long id) {
             this.id = id;
         }
 
-        IdbObjectStore build() {
-            var indexList = new ArrayList<IdbIndex>();
-            for (var index : indexes.values()) {
-                if (index.name != null && index.keyPath != null) {
-                    indexList.add(new IdbIndex(index.id, index.name, index.keyPath, index.unique, index.multiEntry));
-                }
-            }
+        /// {@return the store's definition}
+        ///
+        /// @throws ViridianException if the metadata describes a store `createObjectStore` would refuse
+        IdbObjectStore build(String database) throws ViridianException {
+            var builder = IdbObjectStore.builder(name);
             // Stores of old schemas have no flag, and a key path that decodes to none
             var path = Boolean.FALSE.equals(hasKeyPath) ? null : keyPath;
-            return new IdbObjectStore(id, name, path, autoIncrement, indexList);
+            if (path != null) {
+                builder.keyPath(path);
+            }
+            if (autoIncrement) {
+                builder.autoIncrement();
+            }
+            try {
+                for (var index : indexes.values()) {
+                    if (index.name != null && index.keyPath != null) {
+                        builder.index(new IdbIndex(index.name, index.keyPath, index.unique, index.multiEntry));
+                    }
+                }
+                return builder.build();
+            } catch (IllegalArgumentException exception) {
+                throw new ViridianException(ViridianException.Reason.CORRUPTED, "The object store " + name + " of " + database
+                        + " is not one IndexedDB makes", exception);
+            }
         }
     }
 
@@ -439,6 +551,10 @@ public final class LevelDbIndexedDatabase implements IndexedDatabase {
         IndexBuilder(long id) {
             this.id = id;
         }
+    }
+
+    /// A record's key, decoded and encoded, and its stored value.
+    private record Keyed(IdbKey key, byte[] encodedKey, byte[] value) {
     }
 
     /// An encoded key compared by content.

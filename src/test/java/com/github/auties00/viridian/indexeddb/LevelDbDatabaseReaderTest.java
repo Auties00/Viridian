@@ -3,6 +3,7 @@ package com.github.auties00.viridian.indexeddb;
 import com.github.auties00.viridian.IdbKey;
 import com.github.auties00.viridian.IdbKeyPath;
 import com.github.auties00.viridian.IdbRecord;
+import com.github.auties00.viridian.StorageBucket;
 import com.github.auties00.viridian.StorageOrigin;
 import com.github.auties00.viridian.leveldb.LevelDbWriter;
 import com.github.auties00.viridian.value.JsBlob;
@@ -27,7 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The LevelDB IndexedDB backend against an origin's store written by hand: metadata, records, blobs and wrapped
 /// values.
-class LevelDbIndexedDatabaseTest {
+class LevelDbDatabaseReaderTest {
     private static final StorageOrigin ORIGIN = StorageOrigin.parse("https://example.com");
 
     private static byte[] key(byte[]... parts) {
@@ -109,19 +110,19 @@ class LevelDbIndexedDatabaseTest {
         Files.write(blobs.resolve("1").resolve("00").resolve("20"), large);
         writer.writeLog(directory, 3);
 
-        var databases = LevelDbIndexedDatabase.openAll(directory, blobs, ORIGIN);
+        var databases = LevelDbDatabaseReader.openAll(directory, blobs, StorageBucket.defaultOf(ORIGIN));
         assertEquals(1, databases.size(), "the abandoned database is left out");
         try (var app = databases.getFirst()) {
             assertEquals("app", app.name());
             assertEquals(3, app.version());
             var usersStore = app.objectStore("users").orElseThrow();
-            assertEquals(new IdbKeyPath.Single("id"), usersStore.keyPath());
+            assertEquals(java.util.Optional.of(new IdbKeyPath.Single("id")), usersStore.keyPath());
             var index = usersStore.index("byName").orElseThrow();
             assertTrue(index.unique());
             assertEquals(new IdbKeyPath.Single("name"), index.keyPath());
             var filesStore = app.objectStore("files").orElseThrow();
             assertTrue(filesStore.autoIncrement());
-            assertEquals(null, filesStore.keyPath());
+            assertTrue(filesStore.keyPath().isEmpty());
 
             List<IdbRecord> records;
             try (var stream = app.records("users")) {
@@ -132,13 +133,13 @@ class LevelDbIndexedDatabaseTest {
             assertEquals(new JsString("bob"), assertInstanceOf(JsObject.class, records.getFirst().value()).get("name").orElseThrow());
             assertEquals(new JsString("alice"), assertInstanceOf(JsObject.class, records.get(1).value()).get("name").orElseThrow());
 
-            var blobRecord = app.record("files", new IdbKey.NumberKey(1)).orElseThrow();
-            try (var stream = assertInstanceOf(JsBlob.class, blobRecord.value()).open()) {
+            var blobRecord = app.get("files", new IdbKey.NumberKey(1)).orElseThrow();
+            try (var stream = assertInstanceOf(JsBlob.class, blobRecord).open()) {
                 assertArrayEquals("hello".getBytes(StandardCharsets.UTF_8), stream.readAllBytes());
             }
-            var inBlob = app.record("files", new IdbKey.NumberKey(2)).orElseThrow();
-            assertEquals(new JsString("x".repeat(70_000)), inBlob.value());
-            assertTrue(app.record("files", new IdbKey.NumberKey(3)).isEmpty());
+            var inBlob = app.get("files", new IdbKey.NumberKey(2)).orElseThrow();
+            assertEquals(new JsString("x".repeat(70_000)), inBlob);
+            assertTrue(app.get("files", new IdbKey.NumberKey(3)).isEmpty());
         }
     }
 }

@@ -29,6 +29,11 @@ public enum JsColorSpace {
         this.cssName = cssName;
     }
 
+    /// {@return the code Blink serializes for the color space}
+    int code() {
+        return code;
+    }
+
     /// {@return the name the canvas APIs use for the color space}
     public String cssName() {
         return cssName;

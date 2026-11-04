@@ -1,5 +1,6 @@
-# Pushes, pull requests and a weekly run: the test suite on each system, then the readers against profiles a real
-# Chrome writes, on both IndexedDB backends. The weekly run catches a Chrome release that changes a format.
+# Pushes, pull requests and a weekly run: the test suite on each system, then the readers and writers against profiles a
+# real Chrome writes and reads, on both backends, storage buckets and partitioned storage included, and the profile
+# lock against a real Chrome. The weekly run catches a Chrome release that changes a format.
 name: CI
 
 on:
@@ -110,6 +111,27 @@ jobs:
           VIRIDIAN_CHROME_MANIFEST: ${{ runner.temp }}/manifest.tsv
         run: mvn -B -ntp test -Dtest=ChromeProfileTest -Dsurefire.failIfNoSpecifiedTests=false
 
+      # Viridian copies everything the profile holds into a new one, which Chrome must read back as it wrote the
+      # original, and keep writing to
+      - name: Copy it with Viridian
+        env:
+          VIRIDIAN_CHROME_PROFILE: ${{ runner.temp }}/profile/Default
+          VIRIDIAN_CHROME_MANIFEST: ${{ runner.temp }}/manifest.tsv
+          VIRIDIAN_COPY_USER_DATA: ${{ runner.temp }}/copy
+        run: mvn -B -ntp test -Dtest=ChromeCopyTest -Dsurefire.failIfNoSpecifiedTests=false
+
+      - name: Have Chrome read the copy
+        working-directory: ci/chrome
+        env:
+          CHROME: ${{ steps.chrome.outputs.path }}
+        run: node read.mjs "$CHROME" "$RUNNER_TEMP/copy" ${{ matrix.backend }} "$RUNNER_TEMP/manifest.tsv"
+
+      # A Chrome started while Viridian writes must not open the profile, and Viridian must not write one Chrome runs on
+      - name: Hold the profile lock against Chrome
+        env:
+          VIRIDIAN_CHROME_EXECUTABLE: ${{ steps.chrome.outputs.path }}
+        run: mvn -B -ntp test -Dtest=ChromeLockTest -Dsurefire.failIfNoSpecifiedTests=false
+
       - name: Upload the profile and the reports
         if: failure()
         uses: actions/upload-artifact@v4
@@ -122,5 +144,10 @@ jobs:
             ${{ runner.temp }}/profile/Default/Session Storage/
             ${{ runner.temp }}/profile/Default/LocalStorage*
             ${{ runner.temp }}/profile/Default/SessionStorage*
+            ${{ runner.temp }}/profile/Default/WebStorage/
+            ${{ runner.temp }}/copy/Default/IndexedDB/
+            ${{ runner.temp }}/copy/Default/Local Storage/
+            ${{ runner.temp }}/copy/Default/LocalStorage*
+            ${{ runner.temp }}/copy/Default/WebStorage/
             target/surefire-reports/
           retention-days: 14

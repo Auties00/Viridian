@@ -8,7 +8,7 @@ import java.util.Objects;
 /// surrogate stays as it was stored.
 ///
 /// @param value the string
-public record JsString(String value) implements JsValue {
+public record JsString(String value) implements JsPrimitive {
     /// Creates a string.
     public JsString {
         Objects.requireNonNull(value, "value");

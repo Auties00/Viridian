@@ -1,6 +1,8 @@
 // Writes IndexedDB, localStorage and sessionStorage with every kind of value Viridian reads, then reads it all back
 // and describes it in the canonical form ChromeProfileTest builds from Viridian's own reading. The two descriptions
-// must match line for line.
+// must match line for line. The page also writes IndexedDB into a named storage bucket, and, loaded in a frame another
+// site embeds, IndexedDB and localStorage of its partitioned storage key; the lines of those contexts start with
+// "@bucket:<name>" or "@partitioned:<top-level site>" and a tab.
 
 const hex16 = string => {
   let result = '';
@@ -103,8 +105,8 @@ function describeKeyPath(path) {
 
 const request = r => new Promise((resolve, reject) => { r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
 
-function open(name, version, upgrade) {
-  const opening = indexedDB.open(name, version);
+function open(name, version, upgrade, factory = indexedDB) {
+  const opening = factory.open(name, version);
   opening.onupgradeneeded = () => upgrade(opening.result);
   return request(opening);
 }
@@ -184,13 +186,22 @@ window.writeFixture = async function () {
     db.createObjectStore('auto', { autoIncrement: true });
     db.createObjectStore('keys');
     db.createObjectStore('empty', { keyPath: ['a', 'b'], autoIncrement: false });
+    // A key generator past every key, and generated keys Chromium stores without the value and Blink injects
+    db.createObjectStore('counter', { autoIncrement: true });
+    const notes = db.createObjectStore('notes', { keyPath: 'id', autoIncrement: true });
+    notes.createIndex('byId', 'id', { unique: true });
+    notes.createIndex('byText', 'text');
+    db.createObjectStore('nested', { keyPath: 'meta.id', autoIncrement: true });
   });
   const entries = await values();
-  let transaction = database.transaction(['values', 'people', 'auto', 'keys'], 'readwrite');
+  let transaction = database.transaction(['values', 'people', 'auto', 'keys', 'counter', 'notes', 'nested'], 'readwrite');
   for (const [key, value] of entries) transaction.objectStore('values').put(value, key);
   transaction.objectStore('people').put({ id: 2, name: 'bob', tags: ['b', 'shared'], first: 'Bob', last: 'B' });
   transaction.objectStore('people').put({ id: 1, name: 'alice', tags: ['a', 'shared'], first: 'Alice', last: 'A' });
   for (const value of ['first', 'second', { third: 3 }]) transaction.objectStore('auto').add(value);
+  for (const value of ['one', 'two', 'three', 'four', 'five']) transaction.objectStore('counter').add(value);
+  for (const value of [{ text: 'generated' }, { text: 'given', id: 10 }, { text: 'after the given one' }]) transaction.objectStore('notes').add(value);
+  for (const value of [{ text: 'no meta' }, { meta: { other: 1 } }, { meta: { id: 'a string key' } }]) transaction.objectStore('nested').add(value);
   const keys = [0, -1.5, Infinity, -Infinity, new Date(5), new Date(-5), '', 'a', 'é', '你', '￿', 'a\ud800',
     new Uint8Array([]), new Uint8Array([0]), new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9]), [], [1, 'a', [new Date(0)]], [[[]]]];
   for (const key of keys) transaction.objectStore('keys').put(describeKey(key), key);
@@ -203,12 +214,78 @@ window.writeFixture = async function () {
   transaction.objectStore('values').put('deleted', 'gone');
   transaction.objectStore('values').delete('gone');
   await done(transaction);
+  transaction = database.transaction('counter', 'readwrite');
+  transaction.objectStore('counter').delete(IDBKeyRange.lowerBound(4));
+  await done(transaction);
 
   const second = await open('second database', 1, db => db.createObjectStore('only').put('one', 1));
   second.close();
+  database.close();
 
+  // A named storage bucket, which Chromium keeps in a directory of WebStorage its quota database names
+  const drafts = await navigator.storageBuckets.open('drafts');
+  const inBucket = await open('in a bucket', 2, db => {
+    db.createObjectStore('values');
+    db.createObjectStore('generated', { keyPath: 'id', autoIncrement: true }).createIndex('byText', 'text');
+  }, drafts.indexedDB);
+  transaction = inBucket.transaction(['values', 'generated'], 'readwrite');
+  transaction.objectStore('values').put({ draft: 'first', at: new Date(7) }, 'draft');
+  transaction.objectStore('values').put(new Blob(['in a bucket'], { type: 'text/plain' }), 'blob');
+  for (const text of ['one', 'two']) transaction.objectStore('generated').add({ text });
+  await done(transaction);
+  inBucket.close();
+
+  localStorage.setItem('latin', 'café');
+  localStorage.setItem('unicode', '你好 😀');
+  localStorage.setItem('é key', 'ascii value');
+  // Past the SQLite backend's 350-byte threshold, so it compresses them
+  localStorage.setItem('long latin', 'compressible '.repeat(100));
+  localStorage.setItem('long unicode', 'é你 '.repeat(200));
+  sessionStorage.setItem('session key', 'session value é你');
+  sessionStorage.setItem('long', 'session '.repeat(100));
+  return describeProfile();
+};
+
+// Writes the storage of the page's partitioned key, as the frame another site embeds it in has
+window.writePartitioned = async function (topLevelSite) {
+  const db = await open('partitioned', 2, db => {
+    db.createObjectStore('values');
+    db.createObjectStore('generated', { keyPath: 'id', autoIncrement: true });
+  });
+  const transaction = db.transaction(['values', 'generated'], 'readwrite');
+  transaction.objectStore('values').put({ embedded: true, at: new Date(5), list: [1, 'two'] }, 'state');
+  transaction.objectStore('values').put(new File(['partitioned file'], 'frame.txt', { type: 'text/plain', lastModified: 1700000000000 }), 'file');
+  transaction.objectStore('generated').add({ text: 'embedded' });
+  await done(transaction);
+  db.close();
+  localStorage.setItem('partitioned item', 'é in a frame');
+  return window.describePartitioned(topLevelSite);
+};
+
+// Describes the storage of the page's partitioned key: its databases and its localStorage
+window.describePartitioned = async function (topLevelSite) {
+  const lines = [...await describeDatabases(indexedDB)];
+  for (const key of Object.keys(localStorage)) lines.push(['local', hex16(key), hex16(localStorage.getItem(key))].join('\t'));
+  return lines.map(line => '@partitioned:' + topLevelSite + '\t' + line).join('\n');
+};
+
+// Describes every database of the origin, in name order, and its localStorage and this tab's sessionStorage, then
+// the databases of its named bucket: what a profile holds, whoever wrote it
+window.describeProfile = async function () {
+  const lines = await describeDatabases(indexedDB);
+  for (const key of Object.keys(localStorage)) lines.push(['local', hex16(key), hex16(localStorage.getItem(key))].join('\t'));
+  for (const key of Object.keys(sessionStorage)) lines.push(['session', hex16(key), hex16(sessionStorage.getItem(key))].join('\t'));
+  const drafts = await navigator.storageBuckets.open('drafts');
+  for (const line of await describeDatabases(drafts.indexedDB)) lines.push('@bucket:drafts\t' + line);
+  return lines.join('\n');
+};
+
+// Describes every database `factory` has, in name order: stores, records, index entries and key generators
+async function describeDatabases(factory) {
   const lines = [];
-  for (const db of [database, await open('second database', 1, () => {})]) {
+  const names = (await factory.databases()).map(info => info.name).sort();
+  for (const name of names) {
+    const db = await request(factory.open(name));
     lines.push(['database', hex16(db.name), db.version].join('\t'));
     const read = db.transaction(db.objectStoreNames, 'readonly');
     for (const storeName of db.objectStoreNames) {
@@ -223,19 +300,37 @@ window.writeFixture = async function () {
       for (let i = 0; i < storeKeys.length; i++) {
         lines.push(['record', hex16(db.name), hex16(storeName), describeKey(storeKeys[i]), await describe(storeValues[i])].join('\t'));
       }
+      // Every entry of every index, in index order: what a store copied by another writer must reproduce
+      for (const indexName of store.indexNames) {
+        const pairs = [];
+        await new Promise((resolve, reject) => {
+          const cursor = store.index(indexName).openKeyCursor();
+          cursor.onsuccess = () => {
+            if (!cursor.result) return resolve();
+            pairs.push(describeKey(cursor.result.key) + '=' + describeKey(cursor.result.primaryKey));
+            cursor.result.continue();
+          };
+          cursor.onerror = () => reject(cursor.error);
+        });
+        lines.push(['index', hex16(db.name), hex16(storeName), hex16(indexName), pairs.join(';')].join('\t'));
+      }
+    }
+    // The key each store's generator gives next: added, then rolled back, which IndexedDB rolls the generator back with
+    for (const storeName of db.objectStoreNames) {
+      const probe = db.transaction(storeName, 'readwrite');
+      const aborted = new Promise(resolve => { probe.onabort = resolve; });
+      const store = probe.objectStore(storeName);
+      if (!store.autoIncrement) {
+        probe.abort();
+        await aborted;
+        continue;
+      }
+      const key = await request(store.add(store.keyPath === null ? 'probe' : {}));
+      probe.abort();
+      await aborted;
+      lines.push(['generator', hex16(db.name), hex16(storeName), describeKey(key)].join('\t'));
     }
     db.close();
   }
-
-  localStorage.setItem('latin', 'café');
-  localStorage.setItem('unicode', '你好 😀');
-  localStorage.setItem('é key', 'ascii value');
-  // Past the SQLite backend's 350-byte threshold, so it compresses them
-  localStorage.setItem('long latin', 'compressible '.repeat(100));
-  localStorage.setItem('long unicode', 'é你 '.repeat(200));
-  for (const key of Object.keys(localStorage)) lines.push(['local', hex16(key), hex16(localStorage.getItem(key))].join('\t'));
-  sessionStorage.setItem('session key', 'session value é你');
-  sessionStorage.setItem('long', 'session '.repeat(100));
-  for (const key of Object.keys(sessionStorage)) lines.push(['session', hex16(key), hex16(sessionStorage.getItem(key))].join('\t'));
-  return lines.join('\n');
-};
+  return lines;
+}

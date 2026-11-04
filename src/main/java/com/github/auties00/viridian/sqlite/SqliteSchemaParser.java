@@ -9,12 +9,14 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Set;
 
-/// Parses the `CREATE TABLE` and `CREATE INDEX` statements of `sqlite_schema` into what reading their b-trees needs.
+/// Parses the `CREATE TABLE` and `CREATE INDEX` statements of `sqlite_schema` into what reading and writing their
+/// b-trees needs.
 ///
-/// The parser is tolerant: SQLite has already accepted every statement it sees, so it extracts the columns, their
-/// types, collations, defaults and generated-column kinds, the `PRIMARY KEY` and `UNIQUE` constraints, and the table
-/// options, and skips everything else (`CHECK` expressions, foreign-key clauses, conflict clauses, constraint names)
-/// without interpreting it.
+/// The parser is tolerant: SQLite has already accepted every statement a reader sees, so it extracts the columns,
+/// their types, collations, defaults, `NOT NULL` constraints and generated-column kinds, the `PRIMARY KEY` and
+/// `UNIQUE` constraints, the table options, and whether the statement has `CHECK` constraints or conflict clauses that
+/// let a violating insert succeed, and skips everything else (the `CHECK` expressions themselves, foreign-key clauses,
+/// constraint names) without interpreting it.
 ///
 /// @spec https://www.sqlite.org/lang_createtable.html CREATE TABLE
 /// @spec https://www.sqlite.org/lang_createindex.html CREATE INDEX
@@ -48,8 +50,9 @@ final class SqliteSchemaParser {
     /// @param defaultValue   the `DEFAULT` constraint's value, or [Literal#NONE]
     /// @param generated      whether and how the column is generated
     /// @param affinity       the column's type affinity
+    /// @param notNull        whether the column has a `NOT NULL` constraint
     record Column(String name, String declaredType, boolean integerType, String collation, Literal defaultValue,
-                  Generated generated, SqliteAffinity affinity) {
+                  Generated generated, SqliteAffinity affinity, boolean notNull) {
     }
 
     /// A term of a key: a column of a `PRIMARY KEY`, `UNIQUE` or `CREATE INDEX` list.
@@ -68,7 +71,9 @@ final class SqliteSchemaParser {
     /// @param inColumn           whether the constraint is part of a column definition rather than a table constraint
     /// @param descendingInColumn whether a column's `PRIMARY KEY` is followed by `DESC`, which keeps an `INTEGER`
     ///                           column from being a rowid alias
-    record KeyConstraint(boolean primaryKey, List<Term> terms, boolean inColumn, boolean descendingInColumn) {
+    /// @param autoincrement      whether the `PRIMARY KEY` is marked `AUTOINCREMENT`
+    record KeyConstraint(boolean primaryKey, List<Term> terms, boolean inColumn, boolean descendingInColumn,
+                         boolean autoincrement) {
     }
 
     /// A parsed `CREATE TABLE` or `CREATE VIRTUAL TABLE` statement.
@@ -79,8 +84,11 @@ final class SqliteSchemaParser {
     /// @param withoutRowid whether the table is `WITHOUT ROWID`
     /// @param strict       whether the table is `STRICT`
     /// @param virtual      whether the statement is `CREATE VIRTUAL TABLE`
+    /// @param checks       whether the table or one of its columns has a `CHECK` constraint
+    /// @param lenient      whether a conflict clause resolves a violation with `REPLACE` or `IGNORE`, so that an insert
+    ///                     violating the constraint does not fail
     record Table(String name, List<Column> columns, List<KeyConstraint> keys, boolean withoutRowid, boolean strict,
-                 boolean virtual) {
+                 boolean virtual, boolean checks, boolean lenient) {
         /// {@return the primary key constraint, or `null` if the table declares none}
         KeyConstraint primaryKey() {
             for (var key : keys) {
@@ -129,7 +137,8 @@ final class SqliteSchemaParser {
     /// @param unique  whether the index is `UNIQUE`
     /// @param terms   the indexed columns and expressions
     /// @param partial whether the index has a `WHERE` clause
-    record Index(String name, String table, boolean unique, List<Term> terms, boolean partial) {
+    /// @param where   the `WHERE` clause's expression as written, without a trailing `;`, or `null` if there is none
+    record Index(String name, String table, boolean unique, List<Term> terms, boolean partial, String where) {
     }
 
     /// A `DEFAULT` value as written, before the column's affinity converts it.
@@ -180,6 +189,9 @@ final class SqliteSchemaParser {
         /// Whether and how the column is generated.
         private Generated generated = Generated.NONE;
 
+        /// Whether the column has a `NOT NULL` constraint.
+        private boolean notNull;
+
         /// Starts a column named `name`.
         private ColumnBuilder(String name) {
             this.name = name;
@@ -194,6 +206,15 @@ final class SqliteSchemaParser {
 
     /// The index of the next token.
     private int position;
+
+    /// Whether a `CHECK` constraint has been seen.
+    private boolean checks;
+
+    /// Whether a conflict clause naming `REPLACE` or `IGNORE` has been seen.
+    private boolean lenient;
+
+    /// Whether a key term parsed since this was last cleared was followed by `AUTOINCREMENT`.
+    private boolean autoincrementTerm;
 
     /// Tokenizes `sql`.
     private SqliteSchemaParser(String sql) throws IOException {
@@ -224,7 +245,7 @@ final class SqliteSchemaParser {
         if (acceptWord("virtual")) {
             expectWord("table");
             skipIfNotExists();
-            return new Table(qualifiedName(), List.of(), List.of(), false, false, true);
+            return new Table(qualifiedName(), List.of(), List.of(), false, false, true, false, false);
         }
         expectWord("table");
         skipIfNotExists();
@@ -274,7 +295,7 @@ final class SqliteSchemaParser {
         for (var column : columns) {
             finished.add(finish(column, strict));
         }
-        return new Table(name, List.copyOf(finished), List.copyOf(keys), withoutRowid, strict, false);
+        return new Table(name, List.copyOf(finished), List.copyOf(keys), withoutRowid, strict, false, checks, lenient);
     }
 
     /// Parses a `CREATE INDEX` statement.
@@ -288,7 +309,16 @@ final class SqliteSchemaParser {
         var table = name();
         var terms = terms(true);
         var partial = acceptWord("where");
-        return new Index(name, table, unique, terms, partial);
+        String where = null;
+        if (partial) {
+            var start = peek().start();
+            var end = start;
+            while (peek().kind() != Kind.END && !isSymbol(peek(), ";")) {
+                end = next().end();
+            }
+            where = sql.substring(start, end);
+        }
+        return new Index(name, table, unique, terms, partial, where);
     }
 
     /// Parses a column definition, adding its `PRIMARY KEY` and `UNIQUE` constraints to `keys`.
@@ -333,12 +363,13 @@ final class SqliteSchemaParser {
                         acceptWord("asc");
                     }
                     conflictClause();
-                    acceptWord("autoincrement");
+                    var autoincrement = acceptWord("autoincrement");
                     var term = new Term(column.name, column.name, null, descending);
-                    keys.add(new KeyConstraint(true, List.of(term), true, descending));
+                    keys.add(new KeyConstraint(true, List.of(term), true, descending, autoincrement));
                 }
                 case "not" -> {
                     if (acceptWord("null")) {
+                        column.notNull = true;
                         conflictClause();
                     } else if (acceptWord("deferrable")) {
                         deferrableClause();
@@ -347,9 +378,12 @@ final class SqliteSchemaParser {
                 case "null" -> conflictClause();
                 case "unique" -> {
                     conflictClause();
-                    keys.add(new KeyConstraint(false, List.of(new Term(column.name, column.name, null, false)), true, false));
+                    keys.add(new KeyConstraint(false, List.of(new Term(column.name, column.name, null, false)), true, false, false));
                 }
-                case "check" -> skipParentheses();
+                case "check" -> {
+                    checks = true;
+                    skipParentheses();
+                }
                 case "default" -> column.defaultValue = defaultValue();
                 case "collate" -> column.collation = name();
                 case "references" -> foreignKeyClause();
@@ -376,12 +410,15 @@ final class SqliteSchemaParser {
         }
         if (acceptWord("primary")) {
             expectWord("key");
-            keys.add(new KeyConstraint(true, terms(false), false, false));
+            autoincrementTerm = false;
+            var terms = terms(false);
+            keys.add(new KeyConstraint(true, terms, false, false, autoincrementTerm));
             conflictClause();
         } else if (acceptWord("unique")) {
-            keys.add(new KeyConstraint(false, terms(false), false, false));
+            keys.add(new KeyConstraint(false, terms(false), false, false, false));
             conflictClause();
         } else if (acceptWord("check")) {
+            checks = true;
             skipParentheses();
             conflictClause();
         } else if (acceptWord("foreign")) {
@@ -430,6 +467,7 @@ final class SqliteSchemaParser {
     private Term term(int start, int end, boolean expressions) throws IOException {
         var last = end;
         if (last - start > 1 && isWord(tokens.get(last - 1), "autoincrement")) {
+            autoincrementTerm = true;
             last--;
         }
         var descending = false;
@@ -574,12 +612,13 @@ final class SqliteSchemaParser {
         }
     }
 
-    /// Skips an `ON CONFLICT` clause, if one comes next.
+    /// Skips an `ON CONFLICT` clause, if one comes next, noting whether it lets a violating insert succeed.
     private void conflictClause() {
         if (isWord(peek(), "on") && isWord(peek(1), "conflict")) {
             next();
             next();
-            next();
+            var resolution = next();
+            lenient |= isWord(resolution, "replace") || isWord(resolution, "ignore");
         }
     }
 
@@ -634,7 +673,8 @@ final class SqliteSchemaParser {
     private static Column finish(ColumnBuilder column, boolean strict) {
         var raw = column.rawType;
         if (raw.isEmpty()) {
-            return new Column(column.name, "", false, column.collation, column.defaultValue, column.generated, SqliteAffinity.BLOB);
+            return new Column(column.name, "", false, column.collation, column.defaultValue, column.generated, SqliteAffinity.BLOB,
+                    column.notNull);
         }
         var span = raw;
         if (span.length() >= 3) {
@@ -649,13 +689,13 @@ final class SqliteSchemaParser {
                         default -> SqliteAffinity.TEXT;
                     };
                     return new Column(column.name, standard, standard.equals("INTEGER"), column.collation,
-                            column.defaultValue, column.generated, affinity);
+                            column.defaultValue, column.generated, affinity, column.notNull);
                 }
             }
         }
         var declared = dequote(span);
         return new Column(column.name, declared, false, column.collation, column.defaultValue, column.generated,
-                SqliteAffinity.ofTypeName(declared));
+                SqliteAffinity.ofTypeName(declared), column.notNull);
     }
 
     /// {@return `span` without its enclosing quotes if it is one quoted token with no quote inside}

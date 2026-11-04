@@ -10,6 +10,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.BiConsumer;
+import java.util.function.ToIntFunction;
 
 /// Decodes one serialized script value: Blink's version envelope, V8's header, then V8's value with Blink's host
 /// objects.
@@ -35,8 +36,10 @@ final class V8Decoder {
     private static final int MAX_DEPTH = 2048;
 
     private final ByteCursor input;
-    // The blobs and files among the external objects, which is what Blink's blob and file indexes count
-    private final List<ExternalObject> blobInfos;
+    // The blobs and files stored beside the value, which Blink's blob and file indexes count
+    private final List<? extends JsBlob> blobInfos;
+    // The File System Access tokens stored beside the value, which a handle's index counts, or null if not given
+    private final List<byte[]> tokens;
     private final List<JsValue> objects;
     // Version 13 data was written with view flags V8 13 did not announce; V8 retries such data reading them
     private final boolean version13Views;
@@ -44,22 +47,26 @@ final class V8Decoder {
     private int blinkVersion;
     private int depth;
 
-    private V8Decoder(byte[] data, int start, int end, List<ExternalObject> externals, boolean version13Views) {
+    private V8Decoder(byte[] data, int start, int end, List<? extends JsBlob> blobs, List<byte[]> tokens, boolean version13Views) {
         this.input = new ByteCursor(data, start, end);
-        this.blobInfos = externals.stream().filter(external -> !(external instanceof ExternalObject.FileSystemAccessHandle)).toList();
+        this.blobInfos = blobs;
+        this.tokens = tokens;
         this.objects = new ArrayList<>();
         this.version13Views = version13Views;
     }
 
     /// {@return the value `data[start, end)` holds}
-    static JsValue decode(byte[] data, int start, int end, List<ExternalObject> externals) throws ViridianException {
-        var decoder = new V8Decoder(data, start, end, externals, false);
+    ///
+    /// @param blobs  the blobs and files stored beside the value
+    /// @param tokens the File System Access tokens stored beside it, or `null` if they are not known
+    static JsValue decode(byte[] data, int start, int end, List<? extends JsBlob> blobs, List<byte[]> tokens) throws ViridianException {
+        var decoder = new V8Decoder(data, start, end, blobs, tokens, false);
         try {
             return decoder.run();
         } catch (IOException failure) {
             if (decoder.v8Version == 13) {
                 try {
-                    return new V8Decoder(data, start, end, externals, true).run();
+                    return new V8Decoder(data, start, end, blobs, tokens, true).run();
                 } catch (IOException ignored) {
                     // The data is damaged either way: report the failure of the regular reading
                 }
@@ -147,8 +154,8 @@ final class V8Decoder {
                 input.varint32();
                 yield readObject();
             }
-            case '_' -> JsUndefined.INSTANCE;
-            case '0' -> JsNull.INSTANCE;
+            case '_' -> JsValue.UNDEFINED;
+            case '0' -> JsValue.NULL;
             case 'T' -> JsBoolean.TRUE;
             case 'F' -> JsBoolean.FALSE;
             case 'I' -> {
@@ -331,14 +338,13 @@ final class V8Decoder {
 
     private JsWrapper readWrapper(int tag) throws IOException {
         var id = reserve();
-        JsValue primitive = switch (tag) {
-            case 'y' -> JsBoolean.TRUE;
-            case 'x' -> JsBoolean.FALSE;
-            case 'n' -> new JsNumber(input.f64le());
-            case 'z' -> new JsBigInt(readBigInt());
-            default -> new JsString(readString());
+        var wrapper = switch (tag) {
+            case 'y' -> JsWrapper.of(JsBoolean.TRUE);
+            case 'x' -> JsWrapper.of(JsBoolean.FALSE);
+            case 'n' -> JsWrapper.of(new JsNumber(input.f64le()));
+            case 'z' -> JsWrapper.of(new JsBigInt(readBigInt()));
+            default -> JsWrapper.of(new JsString(readString()));
         };
-        var wrapper = new JsWrapper(primitive);
         objects.set(id, wrapper);
         return wrapper;
     }
@@ -347,9 +353,9 @@ final class V8Decoder {
         var id = reserve();
         var source = readString();
         var flags = input.varint32();
-        // Bits past the nine flags V8 defines are invalid
-        if ((flags & ~0x1FF) != 0) {
-            throw corrupted("A regular expression has unknown flags 0x" + Integer.toHexString(flags));
+        // Bits past the nine flags V8 defines are invalid, as is the u flag with the v flag
+        if ((flags & ~0x1FF) != 0 || (flags & JsNumbers.UNICODE_FLAGS) == JsNumbers.UNICODE_FLAGS) {
+            throw corrupted("A regular expression has invalid flags 0x" + Integer.toHexString(flags));
         }
         var regexp = new JsRegExp(source, JsNumbers.regExpFlags(flags));
         objects.set(id, regexp);
@@ -515,9 +521,16 @@ final class V8Decoder {
             case 'k' -> new JsRtcCertificate(readUtf8(), readUtf8());
             case 'n', 'N' -> {
                 var name = readUtf8();
-                // The index of the handle's token among the record's external objects
-                input.varint32();
-                yield new JsFileSystemHandle(tag == 'n' ? JsFileSystemHandle.Kind.FILE : JsFileSystemHandle.Kind.DIRECTORY, name);
+                var index = input.varint32();
+                byte[] token = null;
+                if (tokens != null) {
+                    if (index < 0 || index >= tokens.size()) {
+                        throw new ViridianException(ViridianException.Reason.MISSING, "The value refers to File System Access token "
+                                + Integer.toUnsignedString(index) + ", but " + tokens.size() + " are stored with it");
+                    }
+                    token = tokens.get(index);
+                }
+                yield new JsFileSystemHandle(tag == 'n' ? JsFileSystemHandle.Kind.FILE : JsFileSystemHandle.Kind.DIRECTORY, name, token);
             }
             case 'd' -> new JsDomFileSystem(input.varint32(), readUtf8(), readUtf8());
             case 'x' -> {
@@ -561,19 +574,19 @@ final class V8Decoder {
         return new JsBlob(type, size, null);
     }
 
-    private JsBlob blobAt(int index) throws IOException {
-        return switch (blobInfos.get(index)) {
-            case ExternalObject.Blob blob -> new JsBlob(blob.type(), blob.size(), blob.source());
-            case ExternalObject.File file -> new JsBlob(file.type(), file.size(), file.source());
-            case ExternalObject.FileSystemAccessHandle _ -> throw new IllegalStateException("Handles are not blobs");
-        };
+    /// {@return the blob at `index` among those stored beside the value: the instance itself, or, for a file read
+    /// as a blob, a blob of its bytes}
+    private JsBlob blobAt(int index) {
+        var stored = blobInfos.get(index);
+        return stored instanceof JsFile ? new JsBlob(stored.type(), stored.size(), stored.source()) : stored;
     }
 
-    private JsFile fileAt(int index) throws IOException {
+    /// {@return the file at `index` among those stored beside the value: the instance itself, or, for a blob read as
+    /// a file, a file of its bytes without a name}
+    private JsFile fileAt(int index) {
         return switch (blobInfos.get(index)) {
-            case ExternalObject.File file -> new JsFile(file.name(), file.type(), file.size(), file.lastModified(), file.source());
-            case ExternalObject.Blob blob -> new JsFile("", blob.type(), blob.size(), null, blob.source());
-            case ExternalObject.FileSystemAccessHandle _ -> throw new IllegalStateException("Handles are not files");
+            case JsFile file -> file;
+            case JsBlob blob -> new JsFile("", blob.type(), blob.size(), null, blob.source());
         };
     }
 
@@ -712,36 +725,35 @@ final class V8Decoder {
     private JsCryptoKey readCryptoKey() throws IOException {
         var subTag = input.u8();
         var type = JsCryptoKey.Type.SECRET;
-        JsCryptoKey.Algorithm algorithm;
-        JsCryptoKey.Algorithm hash = null;
-        var length = -1;
-        JsCryptoKey.NamedCurve curve = null;
-        byte[] publicExponent = null;
+        KeyAlgorithm algorithm;
         switch (subTag) {
             case 1 -> {
-                algorithm = algorithm(input.varint32());
-                length = keyBits(input.varint32());
+                var name = find(KeyAlgorithm.Aes.Name.values(), input.varint32(), each -> each.blinkId, "AES");
+                algorithm = new KeyAlgorithm.Aes(name, keyBits(input.varint32()));
             }
             case 2 -> {
-                length = keyBits(input.varint32());
-                algorithm = JsCryptoKey.Algorithm.HMAC;
-                hash = algorithm(input.varint32());
+                var length = keyBits(input.varint32());
+                algorithm = new KeyAlgorithm.Hmac(find(KeyAlgorithm.Hash.values(), input.varint32(), hash -> hash.blinkId, "hash"), length);
             }
             case 4 -> {
-                algorithm = algorithm(input.varint32());
+                var name = find(KeyAlgorithm.RsaHashed.Name.values(), input.varint32(), each -> each.blinkId, "RSA");
                 type = keyType(input.varint32());
-                length = input.varint32();
-                publicExponent = input.bytes(input.varintLength());
-                hash = algorithm(input.varint32());
+                var modulusLength = input.varint32();
+                var exponent = new BigInteger(1, input.bytes(input.varintLength()));
+                var hash = find(KeyAlgorithm.Hash.values(), input.varint32(), each -> each.blinkId, "hash");
+                if (modulusLength <= 0 || exponent.signum() == 0) {
+                    throw corrupted("An RSA CryptoKey has a modulus of " + Integer.toUnsignedString(modulusLength) + " bits or a zero exponent");
+                }
+                algorithm = new KeyAlgorithm.RsaHashed(name, modulusLength, exponent, hash);
             }
             case 5 -> {
-                algorithm = algorithm(input.varint32());
+                var name = find(KeyAlgorithm.Ec.Name.values(), input.varint32(), each -> each.blinkId, "elliptic-curve");
                 type = keyType(input.varint32());
-                curve = JsCryptoKey.NamedCurve.ofId(input.varint32()).orElseThrow(() -> corrupted("A CryptoKey has an unknown curve"));
+                algorithm = new KeyAlgorithm.Ec(name, find(KeyAlgorithm.NamedCurve.values(), input.varint32(), curve -> curve.blinkId, "curve"));
             }
-            case 6 -> algorithm = algorithm(input.varint32());
+            case 6 -> algorithm = new KeyAlgorithm.Basic(find(KeyAlgorithm.Basic.Name.values(), input.varint32(), each -> each.blinkId, "parameterless"));
             case 7, 8, 9 -> {
-                algorithm = algorithm(input.varint32());
+                algorithm = new KeyAlgorithm.Basic(find(KeyAlgorithm.Basic.Name.values(), input.varint32(), each -> each.blinkId, "parameterless"));
                 type = keyType(input.varint32());
             }
             default -> throw unsupported("A CryptoKey has key type " + subTag + ", which this reader does not know");
@@ -751,24 +763,65 @@ final class V8Decoder {
             throw unsupported("A CryptoKey has usages 0x" + Integer.toHexString(mask) + ", which this reader does not know");
         }
         var keyData = input.bytes(input.varintLength());
-        return new JsCryptoKey(type, algorithm, hash, length, curve, publicExponent, JsCryptoKey.usagesOf(mask),
-                (mask & JsCryptoKey.Usage.EXTRACTABLE_BIT) != 0, keyData);
+        return new JsCryptoKey(type, algorithm, JsCryptoKey.usagesOf(mask), (mask & JsCryptoKey.Usage.EXTRACTABLE_BIT) != 0, keyData);
     }
 
     /// {@return the bits of a key `bytes` long}
     private static int keyBits(int bytes) throws ViridianException {
         // Blink refuses AES keys over 65535 bits; HMAC keys of more than 2^28 bytes cannot be in any stored value
-        if (bytes < 0 || bytes > (1 << 28)) {
+        if (bytes <= 0 || bytes > (1 << 28)) {
             throw corrupted("A CryptoKey is " + Integer.toUnsignedString(bytes) + " bytes long");
         }
         return bytes * 8;
     }
 
-    private JsCryptoKey.Algorithm algorithm(int id) throws ViridianException {
-        return JsCryptoKey.Algorithm.ofId(id).orElseThrow(() -> unsupported("A CryptoKey has algorithm " + id + ", which this reader does not know"));
+    /// {@return the constant among `values` whose Blink id is `id`}
+    ///
+    /// @throws ViridianException if none is: an id Blink does not define, or one of another family of algorithms
+    private static <T> T find(T[] values, int id, ToIntFunction<T> idOf, String family) throws ViridianException {
+        for (var value : values) {
+            if (idOf.applyAsInt(value) == id) {
+                return value;
+            }
+        }
+        if (knownAlgorithmId(id)) {
+            throw corrupted("A CryptoKey of the " + family + " kind has algorithm " + id + ", which is of another kind");
+        }
+        throw unsupported("A CryptoKey has " + family + " algorithm " + Integer.toUnsignedString(id) + ", which this reader does not know");
     }
 
-    private JsCryptoKey.Type keyType(int code) throws ViridianException {
+    /// {@return whether Blink defines `id` for an algorithm or hash}
+    private static boolean knownAlgorithmId(int id) {
+        for (var name : KeyAlgorithm.Aes.Name.values()) {
+            if (name.blinkId == id) {
+                return true;
+            }
+        }
+        for (var name : KeyAlgorithm.RsaHashed.Name.values()) {
+            if (name.blinkId == id) {
+                return true;
+            }
+        }
+        for (var name : KeyAlgorithm.Ec.Name.values()) {
+            if (name.blinkId == id) {
+                return true;
+            }
+        }
+        for (var name : KeyAlgorithm.Basic.Name.values()) {
+            if (name.blinkId == id) {
+                return true;
+            }
+        }
+        for (var hash : KeyAlgorithm.Hash.values()) {
+            if (hash.blinkId == id) {
+                return true;
+            }
+        }
+        // HMAC, which no family but its own subtag takes
+        return id == 2;
+    }
+
+    private static JsCryptoKey.Type keyType(int code) throws ViridianException {
         return switch (code) {
             case 1 -> JsCryptoKey.Type.PUBLIC;
             case 2 -> JsCryptoKey.Type.PRIVATE;

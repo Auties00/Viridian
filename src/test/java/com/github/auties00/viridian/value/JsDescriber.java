@@ -65,7 +65,7 @@ public final class JsDescriber {
         return switch (value) {
             case JsArray array -> {
                 var result = new StringBuilder("A").append(array.length()).append('[');
-                for (var entry : array.presentElements().entrySet()) {
+                for (var entry : array.elements().entrySet()) {
                     result.append(entry.getKey()).append('=').append(visit(entry.getValue())).append(';');
                 }
                 result.append('|');
@@ -108,8 +108,8 @@ public final class JsDescriber {
                     + key.usages().stream().map(JsCryptoKey.Usage::webCryptoName).sorted().collect(Collectors.joining("+")) + ","
                     + (key.extractable() ? 1 : 0) + "," + (key.extractable() ? HexFormat.of().formatHex(key.keyData()) : "-");
             case JsFile file -> "F" + hex16(file.name()) + "," + hex16(file.type()) + "," + file.size() + ","
-                    + file.lastModified().map(instant -> Long.toString(instant.toEpochMilli())).orElse("?") + "," + content(file.source().orElse(null));
-            case JsBlob blob -> "L" + hex16(blob.type()) + "," + blob.size() + "," + content(blob.source().orElse(null));
+                    + file.lastModified().map(instant -> Long.toString(instant.toEpochMilli())).orElse("?") + "," + content(file);
+            case JsBlob blob -> "L" + hex16(blob.type()) + "," + blob.size() + "," + content(blob);
             case JsImageData image -> "I" + image.width() + "x" + image.height() + "," + image.colorSpace().cssName() + "," + HexFormat.of().formatHex(image.pixels());
             case JsDomMatrix matrix -> {
                 var values = new StringBuilder();
@@ -129,12 +129,12 @@ public final class JsDescriber {
         return number(point.x()) + "," + number(point.y()) + "," + number(point.z()) + "," + number(point.w());
     }
 
-    private static String content(BlobSource source) {
-        if (source == null) {
+    private static String content(JsBlob blob) {
+        if (!blob.hasBytes()) {
             return "-";
         }
-        try (var stream = source.open()) {
-            return HexFormat.of().formatHex(stream.readAllBytes());
+        try {
+            return HexFormat.of().formatHex(blob.readAllBytes());
         } catch (IOException exception) {
             throw new UncheckedIOException(exception);
         }

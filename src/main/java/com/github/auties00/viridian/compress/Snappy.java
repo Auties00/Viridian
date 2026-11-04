@@ -1,9 +1,11 @@
 package com.github.auties00.viridian.compress;
 
 import java.io.IOException;
+import java.util.Arrays;
+import java.util.Objects;
 
-/// Decompresses the raw Snappy format: the block compression of LevelDB tables, Blink's compressed IndexedDB values,
-/// and the values Chromium's SQLite IndexedDB backend compresses on Android.
+/// Compresses and decompresses the raw Snappy format: the block compression of LevelDB tables, Blink's compressed
+/// IndexedDB values, and the values Chromium's SQLite IndexedDB backend compresses on Android.
 ///
 /// A raw stream is the uncompressed length as an unsigned varint, then a sequence of elements, each a literal run or
 /// a copy of earlier output:
@@ -17,7 +19,155 @@ import java.io.IOException;
 ///
 /// @spec https://github.com/google/snappy/blob/main/format_description.txt Snappy compressed format description
 public final class Snappy {
+    // The compressor works on fragments of this size, so that every copy offset fits in two bytes
+    private static final int FRAGMENT = 1 << 16;
+    private static final int HASH_BITS = 14;
+    // How far the match finder keeps from a fragment's end, so that its 4-byte loads stay inside the fragment
+    private static final int INPUT_MARGIN = 15;
+    // The element tags of a literal run and of the copies with 1 and 2 offset bytes
+    private static final int LITERAL = 0;
+    private static final int COPY_1 = 1;
+    private static final int COPY_2 = 2;
+
     private Snappy() {
+    }
+
+    /// {@return `input[offset, offset + length)` compressed to a raw Snappy stream}
+    ///
+    /// The stream is the one Google's reference compressor writes: each 64 KiB fragment is matched greedily through
+    /// a hash of the 4 bytes at each position, which skips ahead faster the longer it finds no match.
+    ///
+    /// @throws IndexOutOfBoundsException if the range is not within `input`
+    public static byte[] compress(byte[] input, int offset, int length) {
+        Objects.checkFromIndexSize(offset, length, input.length);
+        var output = new byte[32 + length + length / 6];
+        var written = writeVarint(output, 0, length);
+        var table = new int[1 << HASH_BITS];
+        for (var start = offset; start < offset + length; start += FRAGMENT) {
+            Arrays.fill(table, 0);
+            written = compressFragment(input, start, Math.min(FRAGMENT, offset + length - start), output, written, table);
+        }
+        return Arrays.copyOf(output, written);
+    }
+
+    /// Compresses one fragment into `output` from `written`, returning where its output ends.
+    ///
+    /// `table` maps a hash of 4 bytes to the offset in the fragment where they were last seen.
+    private static int compressFragment(byte[] input, int start, int length, byte[] output, int written, int[] table) {
+        var end = start + length;
+        var position = start;
+        var nextEmit = start;
+        if (length >= INPUT_MARGIN) {
+            var limit = end - INPUT_MARGIN;
+            position++;
+            var nextHash = hash(input, position);
+            search:
+            while (true) {
+                var skip = 32;
+                var next = position;
+                int candidate;
+                do {
+                    position = next;
+                    var currentHash = nextHash;
+                    next = position + (skip++ >>> 5);
+                    if (next > limit) {
+                        break search;
+                    }
+                    nextHash = hash(input, next);
+                    candidate = start + table[currentHash];
+                    table[currentHash] = position - start;
+                } while (load32(input, position) != load32(input, candidate));
+                written = emitLiteral(input, nextEmit, position - nextEmit, output, written);
+                do {
+                    var base = position;
+                    var matched = 4 + matchLength(input, candidate + 4, position + 4, end);
+                    position += matched;
+                    written = emitCopy(base - candidate, matched, output, written);
+                    nextEmit = position;
+                    if (position >= limit) {
+                        break search;
+                    }
+                    table[hash(input, position - 1)] = position - 1 - start;
+                    var currentHash = hash(input, position);
+                    candidate = start + table[currentHash];
+                    table[currentHash] = position - start;
+                } while (load32(input, position) == load32(input, candidate));
+                nextHash = hash(input, ++position);
+            }
+        }
+        if (nextEmit < end) {
+            written = emitLiteral(input, nextEmit, end - nextEmit, output, written);
+        }
+        return written;
+    }
+
+    /// {@return how many bytes from `second` equal those from `first`, stopping at `end`}
+    private static int matchLength(byte[] input, int first, int second, int end) {
+        var matched = 0;
+        while (second + matched < end && input[first + matched] == input[second + matched]) {
+            matched++;
+        }
+        return matched;
+    }
+
+    private static int emitLiteral(byte[] input, int from, int length, byte[] output, int written) {
+        var stored = length - 1;
+        if (stored < 60) {
+            output[written++] = (byte) (LITERAL | stored << 2);
+        } else {
+            var lengthBytes = stored < 1 << 8 ? 1 : stored < 1 << 16 ? 2 : stored < 1 << 24 ? 3 : 4;
+            output[written++] = (byte) (LITERAL | (59 + lengthBytes) << 2);
+            for (var i = 0; i < lengthBytes; i++) {
+                output[written++] = (byte) (stored >>> (8 * i));
+            }
+        }
+        System.arraycopy(input, from, output, written, length);
+        return written + length;
+    }
+
+    /// Emits a copy of `length` bytes from `distance` back, in pieces of at most 64 bytes.
+    private static int emitCopy(int distance, int length, byte[] output, int written) {
+        while (length >= 68) {
+            written = emitShortCopy(distance, 64, output, written);
+            length -= 64;
+        }
+        if (length > 64) {
+            // Leaves at least 4 bytes, the shortest copy
+            written = emitShortCopy(distance, 60, output, written);
+            length -= 60;
+        }
+        return emitShortCopy(distance, length, output, written);
+    }
+
+    /// Emits a copy of 4 to 64 bytes, in the 2-byte form when it fits.
+    private static int emitShortCopy(int distance, int length, byte[] output, int written) {
+        if (length < 12 && distance < 2048) {
+            output[written++] = (byte) (COPY_1 | (length - 4) << 2 | (distance >>> 8) << 5);
+            output[written++] = (byte) distance;
+        } else {
+            output[written++] = (byte) (COPY_2 | (length - 1) << 2);
+            output[written++] = (byte) distance;
+            output[written++] = (byte) (distance >>> 8);
+        }
+        return written;
+    }
+
+    private static int hash(byte[] input, int position) {
+        return (load32(input, position) * 0x1e35a7bd) >>> (32 - HASH_BITS);
+    }
+
+    private static int load32(byte[] input, int position) {
+        return (input[position] & 0xFF) | (input[position + 1] & 0xFF) << 8 | (input[position + 2] & 0xFF) << 16
+                | (input[position + 3] & 0xFF) << 24;
+    }
+
+    private static int writeVarint(byte[] output, int written, int value) {
+        while ((value & ~0x7F) != 0) {
+            output[written++] = (byte) (value & 0x7F | 0x80);
+            value >>>= 7;
+        }
+        output[written++] = (byte) value;
+        return written;
     }
 
     /// {@return the bytes the raw Snappy stream in `input[offset, offset + length)` decompresses to}

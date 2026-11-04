@@ -3,6 +3,9 @@ package com.github.auties00.viridian.value;
 import java.util.Arrays;
 
 /// A `DOMMatrix` or `DOMMatrixReadOnly`.
+///
+/// Matrices compare by their values, but are objects all the same: a value that holds one matrix twice holds it by
+/// identity, as [JsValue] describes.
 public final class JsDomMatrix implements JsHostObject {
     private final double[] values;
     private final boolean readOnly;
@@ -10,6 +13,18 @@ public final class JsDomMatrix implements JsHostObject {
     JsDomMatrix(double[] values, boolean readOnly) {
         this.values = values;
         this.readOnly = readOnly;
+    }
+
+    /// {@return a matrix of `values`, copied: 6 for a 2D matrix, `a` to `f`, or 16 for a 3D one, `m11` to `m44` row
+    /// by row}
+    ///
+    /// @param readOnly whether it is a `DOMMatrixReadOnly`
+    /// @throws IllegalArgumentException if there are not 6 or 16 values
+    public static JsDomMatrix of(double[] values, boolean readOnly) {
+        if (values.length != 6 && values.length != 16) {
+            throw new IllegalArgumentException("A matrix has 6 or 16 values, not " + values.length);
+        }
+        return new JsDomMatrix(values.clone(), readOnly);
     }
 
     /// {@return whether the matrix is 2D}
@@ -20,6 +35,11 @@ public final class JsDomMatrix implements JsHostObject {
     /// {@return a copy of the values: `a` to `f` for a 2D matrix, `m11` to `m44` row by row for a 3D one}
     public double[] values() {
         return values.clone();
+    }
+
+    /// {@return the values themselves}
+    double[] rawValues() {
+        return values;
     }
 
     /// {@return whether it is a `DOMMatrixReadOnly`}

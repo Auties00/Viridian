@@ -1,13 +1,13 @@
 package com.github.auties00.viridian.indexeddb;
 
+import com.github.auties00.viridian.IdbDatabaseReader;
 import com.github.auties00.viridian.IdbIndex;
 import com.github.auties00.viridian.IdbKey;
 import com.github.auties00.viridian.IdbKeyPath;
 import com.github.auties00.viridian.IdbObjectStore;
 import com.github.auties00.viridian.IdbRecord;
-import com.github.auties00.viridian.IndexedDatabase;
 import com.github.auties00.viridian.StorageBackend;
-import com.github.auties00.viridian.StorageOrigin;
+import com.github.auties00.viridian.StorageBucket;
 import com.github.auties00.viridian.ViridianException;
 import com.github.auties00.viridian.compress.Snappy;
 import com.github.auties00.viridian.compress.Zstd;
@@ -16,12 +16,13 @@ import com.github.auties00.viridian.sqlite.SqliteDatabase;
 import com.github.auties00.viridian.sqlite.SqliteRow;
 import com.github.auties00.viridian.sqlite.SqliteTable;
 import com.github.auties00.viridian.value.BlobSource;
-import com.github.auties00.viridian.value.ExternalObject;
+import com.github.auties00.viridian.io.ValueAccess;
+import com.github.auties00.viridian.value.JsBlob;
+import com.github.auties00.viridian.value.JsValue;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
@@ -29,14 +30,13 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.NoSuchElementException;
+import java.util.Map;
 import java.util.Optional;
-import java.util.Spliterator;
-import java.util.Spliterators;
+import java.util.OptionalLong;
+import java.util.TreeMap;
 import java.util.stream.Stream;
-import java.util.stream.StreamSupport;
 
 /// An IndexedDB database of Chromium's SQLite backend: one SQLite file, opened read-only, with the database's
 /// metadata, records and blobs.
@@ -58,7 +58,7 @@ import java.util.stream.StreamSupport;
 /// Snappy-compressed (compression type 0, 1 or 2). A blob's bytes are in its row and, past 5 MiB, in overflow
 /// chunks; a blob migrated from the LevelDB backend has no bytes in its row and is a file `<database file>_/<blob
 /// row id in hexadecimal>`.
-public final class SqliteIndexedDatabase implements IndexedDatabase {
+public final class SqliteDatabaseReader implements IdbDatabaseReader, DatabaseSource {
     // The backend's schema versions this reader knows
     private static final int SCHEMA_VERSION = 1;
     private static final int UNCOMPRESSED = 0;
@@ -72,20 +72,25 @@ public final class SqliteIndexedDatabase implements IndexedDatabase {
 
     private final Path file;
     private final SqliteDatabase database;
-    private final StorageOrigin origin;
+    private final StorageBucket bucket;
     private final String name;
     private final long version;
     private final List<IdbObjectStore> objectStores;
+    // The id and key generator of each object store, by name
+    private final Map<String, Long> storeIds;
+    private final Map<String, Long> keyGenerators;
     private boolean closed;
 
-    private SqliteIndexedDatabase(Path file, SqliteDatabase database, StorageOrigin origin, String name, long version,
-                                  List<IdbObjectStore> objectStores) {
+    private SqliteDatabaseReader(Path file, SqliteDatabase database, StorageBucket bucket, String name, long version,
+                                 List<IdbObjectStore> objectStores, Map<String, Long> storeIds, Map<String, Long> keyGenerators) {
         this.file = file;
         this.database = database;
-        this.origin = origin;
+        this.bucket = bucket;
         this.name = name;
         this.version = version;
         this.objectStores = objectStores;
+        this.storeIds = storeIds;
+        this.keyGenerators = keyGenerators;
     }
 
     /// {@return the database in the SQLite file `file`, open; the caller closes it}
@@ -93,7 +98,7 @@ public final class SqliteIndexedDatabase implements IndexedDatabase {
     /// @throws ViridianException if the file is not a database of the backend, or one of a schema this reader does not
     ///                           know
     /// @throws IOException       if the file cannot be read
-    public static SqliteIndexedDatabase open(Path file, StorageOrigin origin) throws IOException {
+    public static SqliteDatabaseReader open(Path file, StorageBucket bucket) throws IOException {
         var database = SqliteDatabase.open(file);
         try {
             checkSchema(database, file);
@@ -116,8 +121,9 @@ public final class SqliteIndexedDatabase implements IndexedDatabase {
                     var row = cursor.row();
                     stores.add(new StoreBuilder(row.getLong(storeTable.columnIndex("id")),
                             IdbKeyCodec.utf16LittleEndian(row.getBlob(storeTable.columnIndex("name"))),
-                            keyPath(row.getBlob(storeTable.columnIndex("key_path"))),
-                            row.getLong(storeTable.columnIndex("auto_increment")) != 0));
+                            keyPath(row.getBlob(storeTable.columnIndex("key_path")), file),
+                            row.getLong(storeTable.columnIndex("auto_increment")) != 0,
+                            row.getLong(storeTable.columnIndex("key_generator_current_number"))));
                 }
             }
             var indexTable = table(database, "indexes", file);
@@ -125,25 +131,37 @@ public final class SqliteIndexedDatabase implements IndexedDatabase {
                 while (cursor.next()) {
                     var row = cursor.row();
                     var storeId = row.getLong(indexTable.columnIndex("object_store_id"));
-                    var keyPath = keyPath(row.getBlob(indexTable.columnIndex("key_path")));
+                    var keyPath = keyPath(row.getBlob(indexTable.columnIndex("key_path")), file);
                     if (keyPath == null) {
                         throw corrupted(file, "has an index without a key path");
                     }
-                    var index = new IdbIndex(row.getLong(indexTable.columnIndex("id")),
-                            IdbKeyCodec.utf16LittleEndian(row.getBlob(indexTable.columnIndex("name"))), keyPath,
-                            row.getLong(indexTable.columnIndex("is_unique")) != 0, row.getLong(indexTable.columnIndex("multi_entry")) != 0);
+                    IdbIndex index;
+                    try {
+                        index = new IdbIndex(IdbKeyCodec.utf16LittleEndian(row.getBlob(indexTable.columnIndex("name"))), keyPath,
+                                row.getLong(indexTable.columnIndex("is_unique")) != 0, row.getLong(indexTable.columnIndex("multi_entry")) != 0);
+                    } catch (IllegalArgumentException exception) {
+                        throw new ViridianException(ViridianException.Reason.CORRUPTED, "The IndexedDB database " + file.getFileName()
+                                + " has an index IndexedDB does not make", exception);
+                    }
                     for (var store : stores) {
                         if (store.id == storeId) {
-                            store.indexes.add(index);
+                            store.indexes.put(row.getLong(indexTable.columnIndex("id")), index);
                         }
                     }
                 }
             }
             var objectStores = new ArrayList<IdbObjectStore>();
+            var storeIds = new LinkedHashMap<String, Long>();
+            var keyGenerators = new LinkedHashMap<String, Long>();
+            stores.sort((first, second) -> Long.compare(first.id, second.id));
             for (var store : stores) {
-                objectStores.add(store.build());
+                objectStores.add(store.build(file));
+                storeIds.put(store.name, store.id);
+                if (store.autoIncrement) {
+                    keyGenerators.put(store.name, store.keyGenerator);
+                }
             }
-            return new SqliteIndexedDatabase(file, database, origin, name, version, List.copyOf(objectStores));
+            return new SqliteDatabaseReader(file, database, bucket, name, version, List.copyOf(objectStores), storeIds, keyGenerators);
         } catch (IOException | RuntimeException exception) {
             try {
                 database.close();
@@ -176,8 +194,8 @@ public final class SqliteIndexedDatabase implements IndexedDatabase {
     }
 
     @Override
-    public StorageOrigin origin() {
-        return origin;
+    public StorageBucket bucket() {
+        return bucket;
     }
 
     @Override
@@ -201,57 +219,80 @@ public final class SqliteIndexedDatabase implements IndexedDatabase {
     }
 
     @Override
-    public Stream<IdbRecord> records(String store) throws IOException {
-        ensureOpen();
-        var storeId = requireStore(store).id();
-        var index = database.findIndex("records_by_key").orElseThrow(() -> corrupted(file, "has no records_by_key index"));
-        var cursor = index.seek(List.of(storeId));
-        var iterator = new Iterator<IdbRecord>() {
-            private IdbRecord next;
-            private boolean done;
-
-            @Override
-            public boolean hasNext() {
-                if (next == null && !done) {
-                    try {
-                        if (cursor.next() && cursor.row().getLong(0) == storeId) {
-                            next = recordAt(cursor.row().rowid());
-                        } else {
-                            done = true;
-                        }
-                    } catch (IOException exception) {
-                        throw new UncheckedIOException(exception);
-                    }
-                }
-                return next != null;
-            }
-
-            @Override
-            public IdbRecord next() {
-                if (!hasNext()) {
-                    throw new NoSuchElementException();
-                }
-                var result = next;
-                next = null;
-                return result;
-            }
-        };
-        return StreamSupport.stream(Spliterators.spliteratorUnknownSize(iterator, Spliterator.ORDERED | Spliterator.NONNULL), false)
-                .onClose(cursor::close);
+    public OptionalLong keyGenerator(String store) {
+        requireStore(store);
+        var generator = keyGenerators.get(store);
+        return generator == null ? OptionalLong.empty() : OptionalLong.of(generator);
     }
 
     @Override
-    public Optional<IdbRecord> record(String store, IdbKey key) throws IOException {
+    public OptionalLong keyGenerator(IdbObjectStore store) {
+        return keyGenerator(store.name());
+    }
+
+    @Override
+    public long count(String store) throws IOException {
         ensureOpen();
-        var storeId = requireStore(store).id();
+        var storeId = requireStoreId(store);
+        var index = database.findIndex("records_by_key").orElseThrow(() -> corrupted(file, "has no records_by_key index"));
+        var count = 0L;
+        try (var cursor = index.seek(List.of(storeId))) {
+            while (cursor.next() && cursor.row().getLong(0) == storeId) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    @Override
+    public Optional<JsValue> get(String store, IdbKey key) throws IOException {
+        ensureOpen();
+        var definition = requireStore(store);
+        var storeId = requireStoreId(store);
         var encodedKey = IdbKeyCodec.encodeSortable(key);
         var index = database.findIndex("records_by_key").orElseThrow(() -> corrupted(file, "has no records_by_key index"));
         try (var cursor = index.seek(List.of(storeId, encodedKey))) {
             if (cursor.next() && cursor.row().getLong(0) == storeId && Arrays.equals(cursor.row().getBlob(1), encodedKey)) {
-                return Optional.of(recordAt(cursor.row().rowid()));
+                return Optional.of(recordAt(cursor.row().rowid()).value(definition));
             }
             return Optional.empty();
         }
+    }
+
+    @Override
+    public Stream<IdbRecord> records(String store) throws IOException {
+        return StoredCursor.stream(openCursor(store));
+    }
+
+    @Override
+    public StoredCursor openCursor(String store) throws IOException {
+        ensureOpen();
+        var definition = requireStore(store);
+        var storeId = requireStoreId(store);
+        var index = database.findIndex("records_by_key").orElseThrow(() -> corrupted(file, "has no records_by_key index"));
+        var cursor = index.seek(List.of(storeId));
+        return new StoredCursor(new StoredCursor.Records() {
+            private boolean done;
+
+            @Override
+            public StoredRecord next() throws IOException {
+                if (!done && cursor.next() && cursor.row().getLong(0) == storeId) {
+                    return recordAt(cursor.row().rowid());
+                }
+                done = true;
+                return null;
+            }
+
+            @Override
+            public void close() {
+                cursor.close();
+            }
+        }, definition);
+    }
+
+    @Override
+    public RecordCursor records(IdbObjectStore store) throws IOException {
+        return StoredCursor.stored(openCursor(store.name()));
     }
 
     /// {@return the record of the `records` row `rowId`}
@@ -261,7 +302,7 @@ public final class SqliteIndexedDatabase implements IndexedDatabase {
         IdbKey key;
         try {
             key = IdbKeyCodec.decodeSortable(row.getBlob(records.columnIndex("key")));
-        } catch (IOException exception) {
+        } catch (IOException | IllegalArgumentException exception) {
             throw new ViridianException(ViridianException.Reason.CORRUPTED, "A record key of " + name + " does not decode", exception);
         }
         var stored = row.getBlob(records.columnIndex("value"));
@@ -272,18 +313,20 @@ public final class SqliteIndexedDatabase implements IndexedDatabase {
             default -> throw new ViridianException(ViridianException.Reason.UNSUPPORTED, "A record of " + name
                     + " has compression type " + row.getLong(records.columnIndex("compression_type")));
         };
-        return new StoredRecord(key, externalObjects(rowId), value, 0);
+        var blobs = new ArrayList<JsBlob>();
+        var tokens = new ArrayList<byte[]>();
+        externalObjects(rowId, blobs, tokens);
+        return new StoredRecord(key, blobs, tokens, value, 0);
     }
 
-    /// {@return the external objects of record `recordRowId`: its blobs and files by row id, then its handles}
-    private List<ExternalObject> externalObjects(long recordRowId) throws IOException {
+    /// Reads the blobs and files of record `recordRowId`, by row id, and its File System Access tokens.
+    private void externalObjects(long recordRowId, List<JsBlob> blobsAndFiles, List<byte[]> handles) throws IOException {
         var references = database.findIndex("blob_references_by_record");
         if (references.isEmpty()) {
-            return List.of();
+            return;
         }
+        var access = ValueAccess.get();
         var blobs = table(database, "blobs", file);
-        var blobsAndFiles = new ArrayList<ExternalObject>();
-        var handles = new ArrayList<ExternalObject>();
         try (var cursor = references.get().seek(List.of(recordRowId))) {
             while (cursor.next() && cursor.row().get(0) instanceof Long rowId && rowId == recordRowId) {
                 var blobRowId = cursor.row().getLong(1);
@@ -291,14 +334,15 @@ public final class SqliteIndexedDatabase implements IndexedDatabase {
                 var type = row.getLong(blobs.columnIndex("object_type"));
                 if (type == FILE_SYSTEM_ACCESS_HANDLE) {
                     var token = row.getBlob(blobs.columnIndex("bytes"));
-                    handles.add(new ExternalObject.FileSystemAccessHandle(token == null ? new byte[0] : token));
+                    handles.add(token == null ? new byte[0] : token);
                     continue;
                 }
                 var mimeType = row.isNull(blobs.columnIndex("mime_type")) ? "" : row.getText(blobs.columnIndex("mime_type"));
-                var size = row.isNull(blobs.columnIndex("size_bytes")) ? -1 : row.getLong(blobs.columnIndex("size_bytes"));
-                var source = blobSource(blobRowId, row.isNull(blobs.columnIndex("bytes")));
+                var legacy = row.isNull(blobs.columnIndex("bytes"));
+                var size = row.isNull(blobs.columnIndex("size_bytes")) ? legacySize(blobRowId, legacy) : row.getLong(blobs.columnIndex("size_bytes"));
+                var source = blobSource(blobRowId, legacy);
                 if (type == BLOB) {
-                    blobsAndFiles.add(new ExternalObject.Blob(mimeType, size, source));
+                    blobsAndFiles.add(access.blob(mimeType, size, source));
                 } else if (type == FILE) {
                     // The column is declared BLOB, but Chromium binds the name as text
                     var fileName = switch (row.get(blobs.columnIndex("file_name"))) {
@@ -308,15 +352,18 @@ public final class SqliteIndexedDatabase implements IndexedDatabase {
                     };
                     var modified = row.isNull(blobs.columnIndex("last_modified")) ? null
                             : WINDOWS_EPOCH.plus(row.getLong(blobs.columnIndex("last_modified")), ChronoUnit.MICROS);
-                    blobsAndFiles.add(new ExternalObject.File(fileName, mimeType, size, modified, source));
+                    blobsAndFiles.add(access.file(fileName, mimeType, size, modified, source));
                 } else {
                     throw corrupted(file, "has a blob of object type " + type);
                 }
             }
         }
-        var all = new ArrayList<ExternalObject>(blobsAndFiles);
-        all.addAll(handles);
-        return all;
+    }
+
+    /// {@return the size of a blob whose row records none: that of its file, if it is kept in one, else 0}
+    private long legacySize(long blobRowId, boolean legacy) throws IOException {
+        var legacyFile = file.resolveSibling(file.getFileName() + "_").resolve(Long.toHexString(blobRowId));
+        return legacy && Files.isRegularFile(legacyFile) ? Files.size(legacyFile) : 0;
     }
 
     /// {@return where the bytes of blob row `blobRowId` are: its rows, or the file of a migrated blob}
@@ -338,6 +385,11 @@ public final class SqliteIndexedDatabase implements IndexedDatabase {
         return objectStore(store).orElseThrow(() -> new IllegalArgumentException("The database " + name + " has no object store " + store));
     }
 
+    private long requireStoreId(String store) {
+        requireStore(store);
+        return storeIds.get(store);
+    }
+
     private void ensureOpen() {
         if (closed) {
             throw new IllegalStateException("The database is closed");
@@ -354,7 +406,7 @@ public final class SqliteIndexedDatabase implements IndexedDatabase {
 
     @Override
     public String toString() {
-        return "IndexedDatabase[" + origin + ", " + name + ", SQLite]";
+        return "IdbDatabaseReader[" + bucket + ", " + name + ", SQLite]";
     }
 
     private static SqliteTable table(SqliteDatabase database, String name, Path file) throws IOException {
@@ -362,12 +414,16 @@ public final class SqliteIndexedDatabase implements IndexedDatabase {
     }
 
     /// {@return the key path a stored key path holds: none for NULL, a single path, or parts joined by spaces}
-    private static IdbKeyPath keyPath(byte[] stored) throws IOException {
+    private static IdbKeyPath keyPath(byte[] stored, Path file) throws IOException {
         if (stored == null) {
             return null;
         }
         var parts = IdbKeyCodec.utf16LittleEndian(stored).split(" ", -1);
-        return parts.length == 1 ? new IdbKeyPath.Single(parts[0]) : new IdbKeyPath.Compound(List.of(parts));
+        try {
+            return parts.length == 1 ? new IdbKeyPath.Single(parts[0]) : new IdbKeyPath.Compound(List.of(parts));
+        } catch (IllegalArgumentException exception) {
+            throw corrupted(file, "has a key path that is not valid");
+        }
     }
 
     private static long number(Object value) {
@@ -394,18 +450,35 @@ public final class SqliteIndexedDatabase implements IndexedDatabase {
         private final String name;
         private final IdbKeyPath keyPath;
         private final boolean autoIncrement;
-        private final List<IdbIndex> indexes = new ArrayList<>();
+        private final long keyGenerator;
+        // The indexes by id
+        private final TreeMap<Long, IdbIndex> indexes = new TreeMap<>();
 
-        StoreBuilder(long id, String name, IdbKeyPath keyPath, boolean autoIncrement) {
+        StoreBuilder(long id, String name, IdbKeyPath keyPath, boolean autoIncrement, long keyGenerator) {
             this.id = id;
             this.name = name;
             this.keyPath = keyPath;
             this.autoIncrement = autoIncrement;
+            this.keyGenerator = keyGenerator;
         }
 
-        IdbObjectStore build() {
-            indexes.sort((first, second) -> Long.compare(first.id(), second.id()));
-            return new IdbObjectStore(id, name, keyPath, autoIncrement, indexes);
+        /// {@return the store's definition}
+        ///
+        /// @throws ViridianException if the rows describe a store `createObjectStore` would refuse
+        IdbObjectStore build(Path file) throws ViridianException {
+            var builder = IdbObjectStore.builder(name);
+            if (keyPath != null) {
+                builder.keyPath(keyPath);
+            }
+            if (autoIncrement) {
+                builder.autoIncrement();
+            }
+            indexes.values().forEach(builder::index);
+            try {
+                return builder.build();
+            } catch (IllegalArgumentException exception) {
+                throw corrupted(file, "has the object store " + name + ", which IndexedDB does not make");
+            }
         }
     }
 

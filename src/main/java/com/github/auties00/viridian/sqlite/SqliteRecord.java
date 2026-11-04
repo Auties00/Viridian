@@ -1,6 +1,7 @@
 package com.github.auties00.viridian.sqlite;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
 /// A record decoded as far as its header: the serial type and the position of every field over a payload.
@@ -17,6 +18,7 @@ import java.util.Arrays;
 ///
 /// [#parse(byte\[\], int, int)] checks that the header and the body fill the payload exactly, so decoding a field
 /// afterwards never fails. A record keeps a reference to the bytes it was parsed from, which are never modified.
+/// [#encode(Object\[\], long)] builds a record as SQLite writes one.
 ///
 /// @spec https://www.sqlite.org/fileformat2.html Database File Format
 final class SqliteRecord {
@@ -87,6 +89,118 @@ final class SqliteRecord {
             throw new IOException("A record's fields fill " + (body - start) + " of its " + length + " bytes");
         }
         return new SqliteRecord(data, types, offsets, size);
+    }
+
+    /// {@return the record of `values`, each `null`, a [Long], a [Double], a [String] or a `byte[]`, in the form SQLite
+    /// writes it}
+    ///
+    /// Every integer takes the narrowest serial type that holds it, 0 and 1 the types 8 and 9 that schema format 4
+    /// allows; a REAL is always type 7, and text is UTF-8.
+    ///
+    /// @throws IllegalArgumentException if the record would be larger than `maxLength` bytes
+    static byte[] encode(Object[] values, long maxLength) {
+        var types = new long[values.length];
+        var texts = new byte[values.length][];
+        var headerSize = 0L;
+        var bodySize = 0L;
+        for (var i = 0; i < values.length; i++) {
+            switch (values[i]) {
+                case null -> types[i] = 0;
+                case Long integer -> {
+                    types[i] = integerType(integer);
+                    bodySize += integerWidth(types[i]);
+                }
+                case Double _ -> {
+                    types[i] = 7;
+                    bodySize += 8;
+                }
+                case String text -> {
+                    texts[i] = text.getBytes(StandardCharsets.UTF_8);
+                    types[i] = texts[i].length * 2L + 13;
+                    bodySize += texts[i].length;
+                }
+                case byte[] blob -> {
+                    types[i] = blob.length * 2L + 12;
+                    bodySize += blob.length;
+                }
+                default -> throw new IllegalArgumentException("A record cannot hold a " + values[i].getClass().getName());
+            }
+            headerSize += SqliteBytes.varintLength(types[i]);
+        }
+        if (headerSize <= 126) {
+            headerSize++;
+        } else {
+            var length = SqliteBytes.varintLength(headerSize);
+            headerSize += length;
+            if (length < SqliteBytes.varintLength(headerSize)) {
+                headerSize++;
+            }
+        }
+        var size = headerSize + bodySize;
+        if (size > maxLength) {
+            throw new IllegalArgumentException("A record of " + size + " bytes is larger than the " + maxLength + " SQLite allows");
+        }
+        var record = new byte[(int) size];
+        var header = SqliteBytes.putVarint(record, 0, headerSize);
+        var body = (int) headerSize;
+        for (var i = 0; i < values.length; i++) {
+            header = SqliteBytes.putVarint(record, header, types[i]);
+            switch (values[i]) {
+                case Long integer -> {
+                    var width = integerWidth(types[i]);
+                    for (var j = 0; j < width; j++) {
+                        record[body + j] = (byte) (integer >>> 8 * (width - 1 - j));
+                    }
+                    body += width;
+                }
+                case Double real -> {
+                    var bits = Double.doubleToRawLongBits(real);
+                    SqliteBytes.putI32(record, body, (int) (bits >>> 32));
+                    SqliteBytes.putI32(record, body + 4, (int) bits);
+                    body += 8;
+                }
+                case String _ -> {
+                    System.arraycopy(texts[i], 0, record, body, texts[i].length);
+                    body += texts[i].length;
+                }
+                case byte[] blob -> {
+                    System.arraycopy(blob, 0, record, body, blob.length);
+                    body += blob.length;
+                }
+                case null, default -> {
+                }
+            }
+        }
+        return record;
+    }
+
+    /// {@return the content size of the integer serial type `type`, 0 for the types 8 and 9}
+    private static int integerWidth(long type) {
+        return type <= 6 ? INTEGER_SIZES[(int) type] : 0;
+    }
+
+    /// {@return the narrowest serial type that holds `value`}
+    private static long integerType(long value) {
+        if (value == 0 || value == 1) {
+            return 8 + value;
+        }
+        var magnitude = value < 0 ? ~value : value;
+        if (magnitude <= 127) {
+            return 1;
+        }
+        if (magnitude <= 32767) {
+            return 2;
+        }
+        if (magnitude <= 8388607) {
+            return 3;
+        }
+        if (magnitude <= 2147483647) {
+            return 4;
+        }
+        if (magnitude <= 140737488355327L) {
+            return 5;
+        }
+        return 6;
     }
 
     /// {@return how many bytes of content a field of serial type `type` has}
