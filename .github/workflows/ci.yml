@@ -85,32 +85,24 @@ jobs:
         with:
           node-version: '22'
 
-      - uses: browser-actions/setup-chrome@v1
-        if: runner.os != 'macOS'
-        id: setup-chrome
-        with:
-          chrome-version: ${{ matrix.channel }}
-
-      # The Chrome that setup-chrome unpacks on macOS, outside an app bundle, starts but never attaches a page. The
-      # bundle copied whole from Google's disk image runs as an installed Chrome does. macOS runs only the stable channel
+      # Puppeteer's own installer, which puppeteer-core depends on: Chrome for Testing of the channel's current build,
+      # laid out the same way on every system
       - name: Install Chrome
-        if: runner.os == 'macOS'
-        id: macos-chrome
+        id: chrome
+        working-directory: ci/chrome
+        env:
+          CHANNEL: ${{ matrix.channel }}
         run: |
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/chrome.dmg" https://dl.google.com/chrome/mac/universal/stable/GGRO/googlechrome.dmg
-          hdiutil attach -quiet -nobrowse -noautoopen -mountpoint "$RUNNER_TEMP/chrome-image" "$RUNNER_TEMP/chrome.dmg"
-          cp -R "$RUNNER_TEMP/chrome-image/Google Chrome.app" "$RUNNER_TEMP/"
-          hdiutil detach -quiet "$RUNNER_TEMP/chrome-image"
-          echo "chrome-path=$RUNNER_TEMP/Google Chrome.app/Contents/MacOS/Google Chrome" >> "$GITHUB_OUTPUT"
+          npm install --no-audit --no-fund
+          installed=$(npx @puppeteer/browsers install "chrome@$CHANNEL" --path "$RUNNER_TEMP/browsers" --format '{{buildId}} {{path}}' | tail -n 1)
+          echo "Chrome for Testing ${installed%% *}"
+          echo "path=${installed#* }" >> "$GITHUB_OUTPUT"
 
       - name: Have Chrome write a profile
         working-directory: ci/chrome
         env:
-          CHROME: ${{ steps.setup-chrome.outputs.chrome-path || steps.macos-chrome.outputs.chrome-path }}
-        run: |
-          npm install --no-audit --no-fund
-          "$CHROME" --version || true
-          node generate.mjs "$CHROME" "$RUNNER_TEMP/profile" ${{ matrix.backend }} "$RUNNER_TEMP/manifest.tsv"
+          CHROME: ${{ steps.chrome.outputs.path }}
+        run: node generate.mjs "$CHROME" "$RUNNER_TEMP/profile" ${{ matrix.backend }} "$RUNNER_TEMP/manifest.tsv"
 
       - name: Read it
         env:
