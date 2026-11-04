@@ -1,0 +1,120 @@
+package com.github.auties00.viridian;
+
+import com.github.auties00.viridian.value.JsDescriber;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.stream.Collectors;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.fail;
+
+/// A profile a real Chrome wrote, which CI makes with `ci/chrome/generate.mjs`: everything Viridian reads must match
+/// what the page read back, line for line.
+///
+/// `VIRIDIAN_CHROME_PROFILE` names the profile directory and `VIRIDIAN_CHROME_MANIFEST` the page's description of
+/// what it stored.
+@EnabledIfEnvironmentVariable(named = "VIRIDIAN_CHROME_MANIFEST", matches = ".+")
+class ChromeProfileTest {
+    private static String keyPath(IdbKeyPath path) {
+        return switch (path) {
+            case null -> "-";
+            case IdbKeyPath.Single single -> "S" + JsDescriber.hex16(single.path());
+            case IdbKeyPath.Compound compound -> "[" + compound.paths().stream().map(JsDescriber::hex16).collect(Collectors.joining(";")) + "]";
+        };
+    }
+
+    private static String key(IdbKey key) {
+        return switch (key) {
+            case IdbKey.NumberKey number -> "N" + JsDescriber.number(number.value());
+            case IdbKey.DateKey date -> "D" + JsDescriber.number(date.time());
+            case IdbKey.StringKey string -> "S" + JsDescriber.hex16(string.value());
+            case IdbKey.BinaryKey binary -> "X" + HexFormat.of().formatHex(binary.bytes());
+            case IdbKey.ArrayKey array -> "[" + array.elements().stream().map(ChromeProfileTest::key).collect(Collectors.joining(";")) + "]";
+        };
+    }
+
+    private static String unhex16(String hex) {
+        var characters = new char[hex.length() / 4];
+        for (var i = 0; i < characters.length; i++) {
+            characters[i] = (char) Integer.parseInt(hex, 4 * i, 4 * i + 4, 16);
+        }
+        return new String(characters);
+    }
+
+    @Test
+    @DisplayName("every database, store, record and storage item reads as the page that wrote it read it back")
+    void matchesChrome() throws IOException {
+        var manifest = Files.readAllLines(Path.of(System.getenv("VIRIDIAN_CHROME_MANIFEST")), StandardCharsets.UTF_8);
+        var origin = StorageOrigin.parse(manifest.get(0).split("\t")[1]);
+        var backend = IndexedDbBackend.valueOf(manifest.get(1).split("\t")[1].toUpperCase());
+        var expected = manifest.subList(2, manifest.size());
+        var profile = ChromiumProfile.open(Path.of(System.getenv("VIRIDIAN_CHROME_PROFILE")));
+        assertEquals(backend, profile.indexedDbBackend(origin).orElseThrow(), "the backend Chrome used");
+
+        var actual = new ArrayList<String>();
+        for (var line : expected) {
+            if (!line.startsWith("database\t")) {
+                continue;
+            }
+            var name = unhex16(line.split("\t")[1]);
+            try (var database = profile.openIndexedDb(origin, name).orElseThrow(() -> new AssertionError("No database " + name))) {
+                assertEquals(backend, database.backend());
+                actual.add(String.join("\t", "database", JsDescriber.hex16(name), Long.toString(database.version())));
+                var stores = new ArrayList<>(database.objectStores());
+                // DOMStringList, which objectStoreNames and indexNames are, sorts its names
+                stores.sort(Comparator.comparing(IdbObjectStore::name));
+                for (var store : stores) {
+                    var indexes = store.indexes().stream()
+                            .sorted(Comparator.comparing(IdbIndex::name))
+                            .map(index -> JsDescriber.hex16(index.name()) + ":" + keyPath(index.keyPath()) + ":" + (index.unique() ? 1 : 0) + ":" + (index.multiEntry() ? 1 : 0))
+                            .collect(Collectors.joining(","));
+                    actual.add(String.join("\t", "store", JsDescriber.hex16(name), JsDescriber.hex16(store.name()), keyPath(store.keyPath()),
+                            store.autoIncrement() ? "1" : "0", indexes));
+                    try (var records = database.records(store.name())) {
+                        for (var record : (Iterable<IdbRecord>) records::iterator) {
+                            actual.add(String.join("\t", "record", JsDescriber.hex16(name), JsDescriber.hex16(store.name()), key(record.key()),
+                                    JsDescriber.describe(record.value())));
+                        }
+                    }
+                }
+            }
+        }
+        var local = new ArrayList<String>();
+        profile.localStorage(origin).forEach((key, value) -> local.add(String.join("\t", "local", JsDescriber.hex16(key), JsDescriber.hex16(value))));
+        var session = new ArrayList<String>();
+        for (var area : profile.sessionStorage(origin)) {
+            area.items().forEach((key, value) -> session.add(String.join("\t", "session", JsDescriber.hex16(key), JsDescriber.hex16(value))));
+        }
+
+        compare("IndexedDB", expected.stream().filter(line -> !line.startsWith("local\t") && !line.startsWith("session\t")).toList(), actual);
+        compare("localStorage", expected.stream().filter(line -> line.startsWith("local\t")).sorted().toList(), local.stream().sorted().toList());
+        compare("sessionStorage", expected.stream().filter(line -> line.startsWith("session\t")).sorted().toList(), session.stream().sorted().toList());
+    }
+
+    /// Fails on the first line that differs, showing both lines cut short, since a line may hold megabytes.
+    private static void compare(String what, List<String> expected, List<String> actual) {
+        for (var i = 0; i < Math.max(expected.size(), actual.size()); i++) {
+            var wanted = i < expected.size() ? expected.get(i) : "<none>";
+            var got = i < actual.size() ? actual.get(i) : "<none>";
+            if (!wanted.equals(got)) {
+                var at = 0;
+                while (at < Math.min(wanted.length(), got.length()) && wanted.charAt(at) == got.charAt(at)) {
+                    at++;
+                }
+                var from = Math.max(0, at - 120);
+                fail(what + " line " + i + " differs at character " + at + ":\n  Chrome:   ..." + wanted.substring(from, Math.min(wanted.length(), at + 200))
+                        + "\n  Viridian: ..." + got.substring(from, Math.min(got.length(), at + 200)));
+            }
+        }
+    }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "viridian-chrome-fixture",
+  "private": true,
+  "description": "Has a real Chrome write a profile for Viridian's tests to read",
+  "type": "module",
+  "dependencies": {
+    "puppeteer-core": "25.16.0"
+  }
+}

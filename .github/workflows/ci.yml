@@ -1,0 +1,117 @@
+# Pushes, pull requests and a weekly run: the test suite on each system, then the readers against profiles a real
+# Chrome writes, on both IndexedDB backends. The weekly run catches a Chrome release that changes a format.
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  pull_request:
+  schedule:
+    - cron: '17 5 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '26'
+          cache: maven
+
+      - name: Test
+        run: mvn -B -ntp verify
+
+      - name: Upload the test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ matrix.os }}
+          path: target/surefire-reports/
+          retention-days: 14
+
+  chrome:
+    name: Chrome ${{ matrix.channel }} on ${{ matrix.os }}, ${{ matrix.backend }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        backend: [leveldb, sqlite]
+        channel: [stable]
+        include:
+          - os: ubuntu-latest
+            backend: leveldb
+            channel: beta
+          - os: ubuntu-latest
+            backend: sqlite
+            channel: beta
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '26'
+          cache: maven
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: browser-actions/setup-chrome@v1
+        id: chrome
+        with:
+          chrome-version: ${{ matrix.channel }}
+
+      - name: Have Chrome write a profile
+        working-directory: ci/chrome
+        run: |
+          npm install --no-audit --no-fund
+          "${{ steps.chrome.outputs.chrome-path }}" --version || true
+          node generate.mjs "${{ steps.chrome.outputs.chrome-path }}" "$RUNNER_TEMP/profile" ${{ matrix.backend }} "$RUNNER_TEMP/manifest.tsv"
+
+      - name: Read it
+        env:
+          VIRIDIAN_CHROME_PROFILE: ${{ runner.temp }}/profile/Default
+          VIRIDIAN_CHROME_MANIFEST: ${{ runner.temp }}/manifest.tsv
+        run: mvn -B -ntp test -Dtest=ChromeProfileTest -Dsurefire.failIfNoSpecifiedTests=false
+
+      - name: Upload the profile and the reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-${{ matrix.channel }}-${{ matrix.os }}-${{ matrix.backend }}
+          path: |
+            ${{ runner.temp }}/manifest.tsv
+            ${{ runner.temp }}/profile/Default/IndexedDB/
+            ${{ runner.temp }}/profile/Default/Local Storage/
+            ${{ runner.temp }}/profile/Default/Session Storage/
+            target/surefire-reports/
+          retention-days: 14
