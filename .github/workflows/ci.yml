@@ -86,16 +86,31 @@ jobs:
           node-version: '22'
 
       - uses: browser-actions/setup-chrome@v1
-        id: chrome
+        if: runner.os != 'macOS'
+        id: setup-chrome
         with:
           chrome-version: ${{ matrix.channel }}
 
+      # The Chrome that setup-chrome unpacks on macOS, outside an app bundle, starts but never attaches a page. The
+      # bundle copied whole from Google's disk image runs as an installed Chrome does. macOS runs only the stable channel
+      - name: Install Chrome
+        if: runner.os == 'macOS'
+        id: macos-chrome
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/chrome.dmg" https://dl.google.com/chrome/mac/universal/stable/GGRO/googlechrome.dmg
+          hdiutil attach -quiet -nobrowse -noautoopen -mountpoint "$RUNNER_TEMP/chrome-image" "$RUNNER_TEMP/chrome.dmg"
+          cp -R "$RUNNER_TEMP/chrome-image/Google Chrome.app" "$RUNNER_TEMP/"
+          hdiutil detach -quiet "$RUNNER_TEMP/chrome-image"
+          echo "chrome-path=$RUNNER_TEMP/Google Chrome.app/Contents/MacOS/Google Chrome" >> "$GITHUB_OUTPUT"
+
       - name: Have Chrome write a profile
         working-directory: ci/chrome
+        env:
+          CHROME: ${{ steps.setup-chrome.outputs.chrome-path || steps.macos-chrome.outputs.chrome-path }}
         run: |
           npm install --no-audit --no-fund
-          "${{ steps.chrome.outputs.chrome-path }}" --version || true
-          node generate.mjs "${{ steps.chrome.outputs.chrome-path }}" "$RUNNER_TEMP/profile" ${{ matrix.backend }} "$RUNNER_TEMP/manifest.tsv"
+          "$CHROME" --version || true
+          node generate.mjs "$CHROME" "$RUNNER_TEMP/profile" ${{ matrix.backend }} "$RUNNER_TEMP/manifest.tsv"
 
       - name: Read it
         env:
